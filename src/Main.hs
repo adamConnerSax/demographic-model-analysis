@@ -1,5 +1,8 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE OverloadedRecordDot #-}
@@ -15,7 +18,8 @@ module Main
   (main)
 where
 
---import qualified BlueRipple.Configuration as BR
+import qualified BlueRipple.Configuration as BR
+import qualified BlueRipple.Utilities.KnitUtils as BRK
 import qualified BlueRipple.Model.Demographic.DataPrep as DDP
 import qualified BlueRipple.Model.Demographic.EnrichData as DED
 import qualified BlueRipple.Model.Demographic.TableProducts as DTP
@@ -24,13 +28,12 @@ import qualified BlueRipple.Model.Demographic.EnrichCensus as DMC
 import qualified BlueRipple.Model.Demographic.MarginalStructure as DMS
 import qualified BlueRipple.Data.Keyed as Keyed
 
-import qualified BlueRipple.Data.ACS_Tables_Loaders as BRC
 import qualified BlueRipple.Data.ACS_PUMS as ACS
 import qualified BlueRipple.Data.Types.Demographic as DT
 import qualified BlueRipple.Data.Types.Geographic as GT
 import qualified BlueRipple.Data.Small.DataFrames as BRDF
 import qualified BlueRipple.Data.Small.Loaders as BRDF
-import qualified BlueRipple.Data.CachingCore as BRKU
+import qualified BlueRipple.Data.CachingCore as BRCC
 
 import qualified Knit.Report as K
 import qualified Knit.Effect.AtomicCache as KC
@@ -47,7 +50,6 @@ import qualified Data.List as List
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
 import qualified Data.Map.Merge.Strict as MM
-import Data.Type.Equality (type (~))
 import qualified Data.Set as S
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
@@ -58,18 +60,13 @@ import qualified Numeric
 import qualified Numeric.LinearAlgebra as LA
 import qualified Control.Foldl as FL
 import qualified Control.Foldl.Statistics as FL
-import qualified Control.Monad as M
 import qualified Frames as F
-import qualified Frames.Transform as FT
 import qualified Frames.Melt as F
 import qualified Frames.Streamly.InCore as FSI
 import qualified Frames.Streamly.CSV as FCSV
 import Frames.Streamly.Streaming.Streamly (StreamlyStream, Stream)
 import qualified Control.MapReduce as MR
 import qualified Frames.MapReduce as FMR
-import qualified Frames.Serialize as FS
-
-import qualified Streamly.Prelude as Streamly
 
 import Control.Lens (view, (^.), _2)
 
@@ -81,8 +78,8 @@ import qualified Graphics.Vega.VegaLite as GV
 import qualified Graphics.Vega.VegaLite.Compat as FV
 import qualified Graphics.Vega.VegaLite.Configuration as FV
 import qualified Graphics.Vega.VegaLite.JSON as VJ
---import Data.Monoid (Sum(getSum))
 
+import qualified System.Environment as Env
 
 templateVars ∷ M.Map String String
 templateVars =
@@ -105,7 +102,7 @@ instance Semigroup CountWithDensity where
       avgDens = (realToFrac n1 * d1 + realToFrac n2 * d2) / realToFrac sumN
 
 instance Monoid CountWithDensity where
-mempty = CountWithDensity 0 0
+  mempty = CountWithDensity 0 0
 
 
 {-
@@ -366,7 +363,7 @@ type TestRow ok ks =  ok V.++ DMC.KeysWD ks
 -- NB: as ks - first component and bs is ks - second
 -- E.g. if you are combining ASR and SER to make ASER ks=ASER, as=E, bs=A
 testNS :: forall  outerK ks (as :: [(Symbol, Type)]) (bs :: [(Symbol, Type)]) qs r .
-           (K.KnitEffects r, BRK.CacheEffects r
+           (K.KnitEffects r, BRCC.CacheEffects r
            , DMC.PredictorModelC as bs (qs V.++ as V.++ bs) qs
            , DMC.PredictedTablesC outerK qs as bs
            , qs ~ F.RDeleteAll (as V.++ bs) ks
@@ -405,11 +402,11 @@ testNS :: forall  outerK ks (as :: [(Symbol, Type)]) (bs :: [(Symbol, Type)]) qs
        -> K.ActionWithCacheTime r (F.FrameRec (TestRow outerK ks))
        -> K.Sem r (K.ActionWithCacheTime r (F.FrameRec (TestRow outerK ks), F.FrameRec (TestRow outerK ks)))
 testNS onSimplexM modelIdE predictionCacheDirE meanAsModel testRowKeyText cmdLine amM seM byPUMA_C test_C = do
---  productFrameCacheKey <- BRK.cacheFromDirE predictionCacheDirE  "productFrame.bin"
+--  productFrameCacheKey <- BRCC.cacheFromDirE predictionCacheDirE  "productFrame.bin"
   let seM' :: Maybe [Set (F.Record (qs V.++ as V.++ bs))]
       seM' = fmap (fmap (S.map F.rcast)) seM
   (predictor_C, ms) <- DMC.predictorModel3 @as @bs @(qs V.++ as V.++ bs) @qs
-    modelIdE predictionCacheDirE meanAsModel cmdLine amM seM' $ fmap (fmap F.rcast) byPUMA_C
+    modelIdE predictionCacheDirE meanAsModel amM seM' $ fmap (fmap F.rcast) byPUMA_C
   let testAs_C = (aggregateAndZeroFillTables @outerK @(F.RDeleteAll bs ks) . fmap F.rcast) <$> test_C
       testBs_C = (aggregateAndZeroFillTables @outerK @(F.RDeleteAll as ks) . fmap F.rcast) <$> test_C
 --      iso :: DMS.IsomorphicKeys (F.Record ks) (F.Record (qs V.++ as V.++ bs)) = DMS.IsomorphicKeys F.rcast F.rcast
@@ -533,7 +530,7 @@ aggregateAndZeroFillTables frame =FL.fold
 
 
 
-compareCSR_ASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRK.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
+compareCSR_ASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareCSR_ASR_ASE cmdLine postInfo = do
     K.logLE K.Info "Building test PUMA-level products for CSR x ASR -> CASR x ASE -> CASER -> ASER"
     let --filterToState sa r = r ^. GT.stateAbbreviation == sa
@@ -555,7 +552,7 @@ compareCSR_ASR_ASE cmdLine postInfo = do
 --    (pumaProduct_CASR, pumaModeled_CASR) <- K.ignoreCacheTime pumaTest_CASR_C
 
     (ascrePredictor_C, ascre_ms) <- DMC.predictorModel3 @[DT.CitizenC, DT.Race5C] @'[DT.Education4C] @DMC.ASCRE @DMC.AS
-                                    (Right "CASR_ASE_ByPUMA") (Right "model/demographic/casr_ase") False cmdLine Nothing Nothing $ fmap (fmap F.rcast) byPUMA_C
+                                    (Right "CASR_ASE_ByPUMA") (Right "model/demographic/casr_ase") False Nothing Nothing $ fmap (fmap F.rcast) byPUMA_C
     let casr_C =  {- (aggregateAndZeroFillTables @DMC.PUMAOuterKeyR @DMC.ASCR . fmap F.rcast) <$> -} fmap snd pumaTest_CASR_C
         ase_C = (aggregateAndZeroFillTables @DMC.PUMAOuterKeyR @DMC.ASE . fmap F.rcast) <$> byPUMA_C
 
@@ -606,7 +603,7 @@ compareCSR_ASR_ASE cmdLine postInfo = do
         ]
 
 
-compareCSR_ASR :: (K.KnitMany r, K.KnitEffects r, BRK.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
+compareCSR_ASR :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareCSR_ASR cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for CSR x ASR -> CASR"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
@@ -692,7 +689,7 @@ compareCSR_ASR cmdLine postInfo = do
 
 
 --type ASR_ASE_OuterKey =
-compareASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRK.CacheEffects r, K.Member PR.RandomFu r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
+compareASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareASR_ASE cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for ASR x ASE -> ASER"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
@@ -865,7 +862,7 @@ compareASR_ASE cmdLine postInfo = do
                            DDP.districtKeyT cmdLine (Just avgSE) byPUMA_C testCDs_C
 
     cdModelPaths <- postPaths "Model_ASR_ASE_ByCD" cmdLine
-    BRK.brNewPost cdModelPaths postInfo "Model_ASR_ASE_ByCD" $ do
+    BRCC.brNewPost cdModelPaths postInfo "Model_ASR_ASE_ByCD" $ do
       compareResults @(DMC.CDOuterKeyR V.++ DMC.ASER)
         cdModelPaths postInfo True "ASR_ASE" ("CD", cdPopMap, DDP.districtKeyT) (Nothing)
         (F.rcast @DMC.ASER)
@@ -887,7 +884,7 @@ compareASR_ASE cmdLine postInfo = do
 -}
     pure ()
 
-compareCASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRK.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
+compareCASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareCASR_ASE cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for CASR x ASE -> CASER"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
@@ -938,7 +935,7 @@ compareCASR_ASE cmdLine postInfo = do
 --        ,MethodResult (fmap F.rcast modeled_CSR_ASR') (Just "NS Model (Yi/Chen)") (Just "NS Model (Yi/Chen)") (Just "NS Model (Yi/Chen)")
         ]
 
-compareSER_ASR :: (K.KnitMany r, K.KnitEffects r, BRK.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
+compareSER_ASR :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareSER_ASR cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for SER x A6SR -> A6SER"
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASER . fmap F.rcast)
@@ -1001,13 +998,13 @@ main = do
     pandocTemplate
     templateVars
     (BRK.brWriterOptionsF . K.mindocOptionsF)
-  let cacheDir = ".flat-kh-cache"
-      knitConfig ∷ K.KnitConfig BRK.SerializerC BRK.CacheData Text =
+  cacheDir <- toText . fromMaybe ".kh-cache" <$> Env.lookupEnv("BR_CACHE_DIR")
+  let knitConfig ∷ K.KnitConfig BRCC.SerializerC BRCC.CacheData Text =
         (K.defaultKnitConfig $ Just cacheDir)
           { K.outerLogPrefix = Just "2022-Demographics"
           , K.logIf = BR.knitLogSeverity $ BR.logLevel cmdLine -- K.logDiagnostic
           , K.pandocWriterConfig = pandocWriterConfig
-          , K.serializeDict = BRK.flatSerializeDict
+          , K.serializeDict = BRCC.flatSerializeDict
           , K.persistCache = KC.persistStrictByteString (\t → toString (cacheDir <> "/" <> t))
           }
       randomGen = SR.mkStdGen 125 -- so we get the same results each time
@@ -1134,7 +1131,7 @@ pumaASERToCSV fileName rows = do
     $ fmap F.rcast rows
 
 
-shiroData :: (K.KnitEffects r, BRK.CacheEffects r) => K.Sem r ()
+shiroData :: (K.KnitEffects r, BRCC.CacheEffects r) => K.Sem r ()
 shiroData = do
   let wText = FCSV.formatTextAsIs
       wPrintf :: (V.KnownField t, V.Snd t ~ Double) => Int -> Int -> V.Lift (->) V.ElField (V.Const Text) t
@@ -1425,14 +1422,14 @@ originalPost cmdLine postInfo = do
           a2FromSER_C
 
     modelA2SERFromSER <- fmap (fmap toOutputRow2)
-                         $ BRK.clearIf' rerunMatches  "model/synthJoint/serToA2SER_MO.bin" >>=
-                         \ck -> K.ignoreCacheTimeM $ BRK.retrieveOrMakeFrame ck
+                         $ BRCC.clearIf' rerunMatches  "model/synthJoint/serToA2SER_MO.bin" >>=
+                         \ck -> K.ignoreCacheTimeM $ BRCC.retrieveOrMakeFrame ck
                                 ((,) <$> serToA2SER_PC False <*> acsSampleSER_C)
                                 $ \(p, d) -> DED.mapPE $ p d
 
     modelCO_A2SERFromSER <- fmap (fmap toOutputRow2)
-                            $ BRK.clearIf' rerunMatches  "model/synthJoint/serToA2SER.bin" >>=
-                            \ck -> K.ignoreCacheTimeM $ BRK.retrieveOrMakeFrame ck
+                            $ BRCC.clearIf' rerunMatches  "model/synthJoint/serToA2SER.bin" >>=
+                            \ck -> K.ignoreCacheTimeM $ BRCC.retrieveOrMakeFrame ck
                                    ((,) <$> serToA2SER_PC True <*> acsSampleSER_C)
                                    $ \(p, d) -> DED.mapPE $ p d
 

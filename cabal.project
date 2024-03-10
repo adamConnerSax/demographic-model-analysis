@@ -9,10 +9,12 @@ allow-newer: polysemy-zoo:ghc-prim, streamly-core
            , heidi:base
            , generic-trie:base
            , streamly-bytestring:streamly-core
-           , nonlinear-optimization:primitive
+           , nonlinear-optimization:primitive, nonlinear-optimization:vector
+           , discrimination:primitive
 
 flags: +streamly9
 
+import: ../../libs/cabal_repo_imports/post-tools.project
 import: ../../libs/cabal_repo_imports/small-data-sets.project
 import: ../../libs/cabal_repo_imports/data-types.project
 import: ../../libs/cabal_repo_imports/data-tools.project
