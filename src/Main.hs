@@ -1009,6 +1009,7 @@ main = do
           }
       randomGen = SR.mkStdGen 125 -- so we get the same results each time
   resE ← K.knitHtmls knitConfig $ PR.runStatefulRandom randomGen $ do
+    K.logKE K.Info $ "Using cache-dir=" <> cacheDir
     K.logLE K.Info $ "Command Line: " <> show cmdLine
     let postInfo = BR.PostInfo (BR.postStage cmdLine) (BR.PubTimes BR.Unpublished Nothing)
 {-    byPUMA_C <-  fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.CASR . fmap F.rcast)
