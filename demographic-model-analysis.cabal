@@ -1,11 +1,11 @@
 cabal-version: 3.0
 
-name:           mpp-analysis
+name:           demographic-model-analysis
 version:        0.1.0.0
 synopsis:       replicate analysis for "Marginal Product Plus"
 category:       Statistics
-homepage:       https://github.com/adamConnerSax/mpp-analysis#readme
-bug-reports:    https://github.com/adamConnerSax/mpp-analysis/issues
+homepage:       https://github.com/adamConnerSax/demographic-model-analysis#readme
+bug-reports:    https://github.com/adamConnerSax/demographic-model-analysis/issues
 author:         Adam Conner-Sax
 maintainer:     adam@blueripplepolitics.org
 copyright:      2024 Adam Conner-Sax
@@ -15,9 +15,9 @@ build-type:     Simple
 
 source-repository head
   type: git
-  location: https://github.com/adamConnerSax/mpp-analysis
+  location: https://github.com/adamConnerSax/demographic-model-analysis
 
-executable mpp-analysis
+executable demographic-model-analysis
   hs-source-dirs: src
   ghc-options: -Wall
   main-is: Main.hs
