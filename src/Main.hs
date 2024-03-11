@@ -1009,7 +1009,7 @@ main = do
           }
       randomGen = SR.mkStdGen 125 -- so we get the same results each time
   resE ← K.knitHtmls knitConfig $ PR.runStatefulRandom randomGen $ do
-    K.logKE K.Info $ "Using cache-dir=" <> cacheDir
+    K.logLE K.Info $ "Using cache-dir=" <> cacheDir
     K.logLE K.Info $ "Command Line: " <> show cmdLine
     let postInfo = BR.PostInfo (BR.postStage cmdLine) (BR.PubTimes BR.Unpublished Nothing)
 {-    byPUMA_C <-  fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.CASR . fmap F.rcast)
@@ -1126,7 +1126,7 @@ pumaASERToCSV fileName rows = do
       formatRows :: V.Rec (V.Lift (->) V.ElField (V.Const Text)) ToCsvR
       formatRows = FCSV.formatTextAsIs V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow
                    V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& V.RNil
-  K.liftKnit @IO $ FCSV.writeLines ("../forPhilip/" <> toString fileName)
+  K.liftKnit @IO $ FCSV.writeLines ("../../forPhilip/" <> toString fileName)
     $ FCSV.streamSV' @_ @(StreamlyStream Stream) newHeaderMap formatRows ","
     $ FCSV.foldableToStream
     $ fmap F.rcast rows
