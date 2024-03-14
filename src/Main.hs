@@ -91,7 +91,7 @@ templateVars =
     ]
 
 pandocTemplate ∷ K.TemplatePath
-pandocTemplate = K.FullySpecifiedTemplatePath "pandoc-templates/blueripple_basic.html"
+pandocTemplate = K.FullySpecifiedTemplatePath "../../research/pandoc-templates/blueripple_basic.html"
 
 data CountWithDensity = CountWithDensity { cwdN :: Int, cwdD ::  Double} deriving stock (Show, Eq)
 
