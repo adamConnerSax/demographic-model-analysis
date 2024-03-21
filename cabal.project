@@ -1,4 +1,4 @@
-packages: ./
+packages: ./ ../../libs/model-demographic
 jobs: 4
 with-compiler: ghc
 
@@ -21,7 +21,7 @@ import: ../../libs/cabal_repo_imports/data-tools.project
 import: ../../libs/cabal_repo_imports/data-loading.project
 import: ../../libs/cabal_repo_imports/data-ACS-Tables.project
 import: ../../libs/cabal_repo_imports/data-ACS-PUMS.project
-import: ../../libs/cabal_repo_imports/model-demographic.project
+--import: ../../libs/cabal_repo_imports/model-demographic.project
 import: ../../libs/cabal_repo_imports/haskell-stan.project
 import: ../../libs/cabal_repo_imports/knit-haskell.project
 import: ../../libs/cabal_repo_imports/Frames-streamly.project

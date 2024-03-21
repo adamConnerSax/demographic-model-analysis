@@ -51,6 +51,7 @@ import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
 import qualified Data.Map.Merge.Strict as MM
 import qualified Data.Set as S
+import qualified Data.Text as T
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
 import qualified Data.Vinyl as V
@@ -59,12 +60,16 @@ import qualified Data.Vinyl.TypeLevel as V
 import qualified Numeric
 import qualified Numeric.LinearAlgebra as LA
 import qualified Control.Foldl as FL
-import qualified Control.Foldl.Statistics as FL
+import qualified Control.Foldl.Statistics as FLS
 import qualified Frames as F
 import qualified Frames.Melt as F
 import qualified Frames.Streamly.InCore as FSI
 import qualified Frames.Streamly.CSV as FCSV
+import qualified Frames.Streamly.Streaming.Streamly as FSS
 import Frames.Streamly.Streaming.Streamly (StreamlyStream, Stream)
+import Frames.Streamly.Streaming.Class (StreamFunctions(..), StreamFunctionsIO(..))
+import qualified Streamly.Data.Stream as Streamly
+import qualified Streamly.Prelude as StreamlyP
 import qualified Control.MapReduce as MR
 import qualified Frames.MapReduce as FMR
 
@@ -124,6 +129,12 @@ data MethodResult ks = MethodResult { mrResult :: ResultFrame ks, _mrTableTitle 
 data ErrorFunction a = ErrorFunction { errLabel :: Text, errF :: a -> a -> Double, errTableFmt :: Double -> Text, errChartScale :: Double -> Double }
 
 data ErrorResults rk a = ErrorResults { errSourceLabel :: Text, errByRegionMap :: Map rk a, errByCell :: [a] }
+
+sortByIndexList :: [Int] -> [a] -> [a]
+sortByIndexList indexOrder'  = fmap snd . sortOn fst . zip indexOrder'
+
+indexOrder :: (a -> a -> Ordering) -> [a] -> [Int]
+indexOrder f = fmap fst . sortBy (\(_, a1) (_, a2) -> f a1 a2) . zip [0..]
 
 compareResults :: forall ks key colKey rowKey a r f .
                   (K.KnitOne r
@@ -261,10 +272,16 @@ compareResults pp pi' showTables showScatters chartDataPrefix (regionType, regio
             pure $ Just $ ErrorResults h byRegionErrMap byCellErrList
   K.logLE K.Info "Computing errors by region and by cell..."
   resultErrs <- catMaybes . FL.fold FL.list <$> traverse resultToErrsM results
+  for_ resultErrs $ \(ErrorResults s brm _) -> do
+    let avgError = FL.fold FLS.mean (M.elems brm)
+    K.logLE K.Info $ "<RegionError(" <> s <> ")>=" <> show avgError
   let errCols = fmap (M.elems . errByRegionMap) resultErrs
       errColHeaders = errSourceLabel <$> resultErrs
       byRegionErrTableRows = zipWith (\region errs -> ErrTableRow region errs) (fmap show allRegions) (transp errCols)
       byCellErrTableRows = zipWith (\cell errs -> ErrTableRow cell errs) [1..] (transp $ fmap errByCell resultErrs)
+--      cellSizeIndexOrder = indexOrder compare $ FL.fold (FL.premap (view DT.popCount) FL.list) actual
+--      byCellSizeErrTableRows = zipWith (\cell errs -> ErrTableRow cell errs) [1..] (transp $ sortByIndexList cellSizeIndexOrder $ fmap errByCell resultErrs)
+--  K.logLE K.Info $ "IndexOrder = " <> show cellSizeIndexOrder
   K.logLE K.Info "Building error-comparison histogram..."
   byRegionErrCompChartVL <- errorCompareHistogram pp pi' (byRegionErrorF.errLabel <> " Histogram")
                             chartDataPrefix (FV.fixedSizeVC 400 400 5) regionType errColHeaders
@@ -288,6 +305,12 @@ compareResults pp pi' showTables showScatters chartDataPrefix (regionType, regio
                           chartDataPrefix (FV.fixedSizeVC 400 400 5) "Cell" errColHeaders
                           (byCellErrorF.errLabel, byCellErrorF.errChartScale) byCellErrTableRows
   _ <- K.addHvega Nothing Nothing byCellErrCompChartVL
+{-
+  byCellSizeErrCompChartVL <- errorCompareScatter pp pi' (byCellErrorF.errLabel <> " by CellSize")
+                              (chartDataPrefix <> "bySize") (FV.fixedSizeVC 400 400 5) "Cell Size in Actual" errColHeaders
+                              (byCellErrorF.errLabel, byCellErrorF.errChartScale) byCellSizeErrTableRows
+  _ <- K.addHvega Nothing Nothing byCellSizeErrCompChartVL
+-}
 
   K.logLE K.Info "Computing per position Errors..."
 {-
@@ -321,8 +344,8 @@ pctFmt = toText @String . PF.printf "%2.1g" . (100 *)
 stdMeanErr :: LA.Vector Double -> LA.Vector Double -> Double
 stdMeanErr acsV dV =
   let x = lmvsk acsV dV
-      m = FL.lmvskMean x
-      v = FL.lmvskVariance x
+      m = FLS.lmvskMean x
+      v = FLS.lmvskVariance x
   in m / sqrt v
 
 l1Err :: LA.Vector Double -> LA.Vector Double -> Double
@@ -339,8 +362,8 @@ l2Err acsV dV = FL.fold
                   <*> FL.premap snd FL.sum)
                 $ zipWith (\acs d -> ((acs - d) * (acs - d), acs)) (VS.toList acsV) (VS.toList dV)
 
-lmvsk :: LA.Vector Double -> LA.Vector Double -> FL.LMVSK
-lmvsk acsV dV = FL.fold FL.fastLMVSK $ VS.toList (acsV - dV)
+lmvsk :: LA.Vector Double -> LA.Vector Double -> FLS.LMVSK
+lmvsk acsV dV = FL.fold FLS.fastLMVSK $ VS.toList (acsV - dV)
 
 transp :: [[a]] -> [[a]]
 transp = go [] where
@@ -393,20 +416,22 @@ testNS :: forall  outerK ks (as :: [(Symbol, Type)]) (bs :: [(Symbol, Type)]) qs
        => DTP.OptimalOnSimplexF r --(forall k . DTP.NullVectorProjections k -> VS.Vector Double -> VS.Vector Double -> K.Sem r (VS.Vector Double))
        -> Either Text Text
        -> Either Text Text
-       -> Bool
+       -> (Int -> DTM3.MeanOrModel)
        -> (F.Record outerK -> Text)
        -> BR.CommandLine
        -> Maybe (LA.Matrix Double)
        -> Maybe [Set (F.Record ks)]
+       -> Maybe Double
        -> K.ActionWithCacheTime r (F.FrameRec (DMC.PUMARowR ks))
        -> K.ActionWithCacheTime r (F.FrameRec (TestRow outerK ks))
        -> K.Sem r (K.ActionWithCacheTime r (F.FrameRec (TestRow outerK ks), F.FrameRec (TestRow outerK ks)))
-testNS onSimplexM modelIdE predictionCacheDirE meanAsModel testRowKeyText cmdLine amM seM byPUMA_C test_C = do
+testNS onSimplexM modelIdE predictionCacheDirE meanOrModelF testRowKeyText cmdLine amM seM fracVarM byPUMA_C test_C = do
 --  productFrameCacheKey <- BRCC.cacheFromDirE predictionCacheDirE  "productFrame.bin"
   let seM' :: Maybe [Set (F.Record (qs V.++ as V.++ bs))]
       seM' = fmap (fmap (S.map F.rcast)) seM
+      numCovariates = S.size (Keyed.elements @(F.Record (qs V.++ as))) + S.size (Keyed.elements @(F.Record (qs V.++ bs)))
   (predictor_C, ms) <- DMC.predictorModel3 @as @bs @(qs V.++ as V.++ bs) @qs
-    modelIdE predictionCacheDirE meanAsModel amM seM' $ fmap (fmap F.rcast) byPUMA_C
+    modelIdE predictionCacheDirE (meanOrModelF $ numCovariates + 1) amM seM' fracVarM $ fmap (fmap F.rcast) byPUMA_C -- +1 for pop density
   let testAs_C = (aggregateAndZeroFillTables @outerK @(F.RDeleteAll bs ks) . fmap F.rcast) <$> test_C
       testBs_C = (aggregateAndZeroFillTables @outerK @(F.RDeleteAll as ks) . fmap F.rcast) <$> test_C
 --      iso :: DMS.IsomorphicKeys (F.Record ks) (F.Record (qs V.++ as V.++ bs)) = DMS.IsomorphicKeys F.rcast F.rcast
@@ -529,7 +554,13 @@ aggregateAndZeroFillTables frame =FL.fold
     innerFld = fmap (F.toFrame . fmap toRec . M.toList) $ FL.premap toKW DMS.zeroFillSummedMapFld
 
 
+tsModelConfig modelId n =  DTM3.ModelConfig True (DTM3.dmr modelId n)
+                           DTM3.AlphaHierNonCentered DTM3.ThetaSimple DTM3.NormalDist
 
+thModelConfig modelId n =  DTM3.ModelConfig True (DTM3.dmr modelId n)
+                           DTM3.AlphaHierNonCentered DTM3.ThetaHierarchical DTM3.NormalDist
+
+{-
 compareCSR_ASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareCSR_ASR_ASE cmdLine postInfo = do
     K.logLE K.Info "Building test PUMA-level products for CSR x ASR -> CASR x ASE -> CASER -> ASER"
@@ -547,12 +578,13 @@ compareCSR_ASR_ASE cmdLine postInfo = do
                        (DTP.viaOptimalWeights DTP.euclideanFull)
                        (Right "CSR_ASR_ByPUMA")
                        (Right "model/demographic/csr_asr_PUMA")
-                       False
-                       (view GT.stateAbbreviation) cmdLine Nothing Nothing (fmap (fmap F.rcast) byPUMA_C) (fmap (fmap F.rcast) testPUMAs_C)
+                       (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
+                       (view GT.stateAbbreviation) cmdLine Nothing Nothing Nothing (fmap (fmap F.rcast) byPUMA_C) (fmap (fmap F.rcast) testPUMAs_C)
 --    (pumaProduct_CASR, pumaModeled_CASR) <- K.ignoreCacheTime pumaTest_CASR_C
 
     (ascrePredictor_C, ascre_ms) <- DMC.predictorModel3 @[DT.CitizenC, DT.Race5C] @'[DT.Education4C] @DMC.ASCRE @DMC.AS
-                                    (Right "CASR_ASE_ByPUMA") (Right "model/demographic/casr_ase") False Nothing Nothing $ fmap (fmap F.rcast) byPUMA_C
+                                    (Right "CASR_ASE_ByPUMA") (Right "model/demographic/casr_ase") (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
+                                    Nothing Nothing Nothing $ fmap (fmap F.rcast) byPUMA_C
     let casr_C =  {- (aggregateAndZeroFillTables @DMC.PUMAOuterKeyR @DMC.ASCR . fmap F.rcast) <$> -} fmap snd pumaTest_CASR_C
         ase_C = (aggregateAndZeroFillTables @DMC.PUMAOuterKeyR @DMC.ASE . fmap F.rcast) <$> byPUMA_C
 
@@ -602,7 +634,7 @@ compareCSR_ASR_ASE cmdLine postInfo = do
         ,MethodResult (fmap F.rcast pumaModeled) (Just "NS Model") (Just "NS Model (L2)") (Just "NS Model")
         ]
 
-
+-}
 compareCSR_ASR :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareCSR_ASR cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for CSR x ASR -> CASR"
@@ -620,8 +652,8 @@ compareCSR_ASR cmdLine postInfo = do
                   (DTP.viaOptimalWeights DTP.euclideanFull)
                   (Right "CSR_ASR_ByPUMA")
                   (Right "model/demographic/csr_asr_PUMA")
-                  False
-                  (show . view GT.pUMA) cmdLine Nothing Nothing byPUMA_C testPUMAs_C
+                  (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
+                  (show . view GT.pUMA) cmdLine Nothing Nothing Nothing byPUMA_C testPUMAs_C
     (pumaProduct, pumaModeled) <- K.ignoreCacheTime pumaTest_C
 
 {-
@@ -664,8 +696,8 @@ compareCSR_ASR cmdLine postInfo = do
                               (DTP.viaOptimalWeights DTP.euclideanFull)
                               (Right "CSR_ASR_ByPUMA")
                               (Right "model/demographic/csr_asr_PUMA")
-                              False
-                              DDP.districtKeyT cmdLine Nothing Nothing byPUMA_C testCDs_C
+                              (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
+                              DDP.districtKeyT cmdLine Nothing Nothing Nothing byPUMA_C testCDs_C
 
     cdModelPaths <- postPaths "Model_CSR_ASR_ByCD" cmdLine
     BRK.brNewPost cdModelPaths postInfo "Model_CSR_ASR_ByCD" $ do
@@ -706,27 +738,62 @@ compareASR_ASE cmdLine postInfo = do
                       (DTP.viaOptimalWeights DTP.euclideanFull)
                       (Right "ASR_ASE_ByPUMA")
                       (Right  "model/demographic/asr_ase")
-                      False
-                      (show . view GT.pUMA) cmdLine Nothing Nothing byPUMA_C testPUMAs_C
+                      (DTM3.Model . tsModelConfig "ASR_ASE_ByPUMA")
+                      (show . view GT.pUMA) cmdLine Nothing Nothing Nothing byPUMA_C testPUMAs_C
     (pumaProduct, pumaModeledRaw) <- K.ignoreCacheTime pumaTestRaw_C
+
     (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
                                        $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.pUMA)) byPUMA_C
     pumaTestSplit_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
                         (DTP.viaOptimalWeights DTP.euclideanFull)
                         (Right "ASR_ASE_TestHalfPUMA")
                         (Right "model/demographic/testHalf_asr_ase")
-                        False
-                        (show . view GT.pUMA) cmdLine Nothing Nothing pumaTraining_C pumaTesting_C
+                        (DTM3.Model . tsModelConfig "ASR_ASE_TestHalfPUMA")
+                        (show . view GT.pUMA) cmdLine Nothing Nothing Nothing pumaTraining_C pumaTesting_C
     (pumaSplitProduct, pumaSplitFull) <- K.ignoreCacheTime pumaTestSplit_C
 
-    pumaTestMean_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
+    pumaTestSplit10_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
+                          (DTP.viaOptimalWeights DTP.euclideanFull)
+                          (Right "ASR_ASE_TestHalfPUMA_10")
+                          (Right "model/demographic/testHalf_asr_ase_10")
+                          (DTM3.Model . tsModelConfig "ASR_ASE_TestHalfPUMA")
+                          (show . view GT.pUMA) cmdLine Nothing Nothing (Just 0.1) pumaTraining_C pumaTesting_C
+    (_, pumaSplitFull10) <- K.ignoreCacheTime pumaTestSplit10_C
+
+    pumaTestSplit50_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
+                          (DTP.viaOptimalWeights DTP.euclideanFull)
+                          (Right "ASR_ASE_TestHalfPUMA_50")
+                          (Right "model/demographic/testHalf_asr_ase_50")
+                          (DTM3.Model . tsModelConfig "ASR_ASE_TestHalfPUMA")
+                          (show . view GT.pUMA) cmdLine Nothing Nothing (Just 0.5) pumaTraining_C pumaTesting_C
+    (_, pumaSplitFull50) <- K.ignoreCacheTime pumaTestSplit50_C
+
+
+    pumaTestSplit90_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
+                          (DTP.viaOptimalWeights DTP.euclideanFull)
+                          (Right "ASR_ASE_TestHalfPUMA_90")
+                          (Right "model/demographic/testHalf_asr_ase_90")
+                          (DTM3.Model . tsModelConfig "ASR_ASE_TestHalfPUMA")
+                          (show . view GT.pUMA) cmdLine Nothing Nothing (Just 0.9) pumaTraining_C pumaTesting_C
+    (_, pumaSplitFull90) <- K.ignoreCacheTime pumaTestSplit90_C
+
+    pumaTestSplitTH_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
+                          (DTP.viaOptimalWeights DTP.euclideanFull)
+                          (Right "ASR_ASE_TestHalfPUMA_TH")
+                          (Right "model/demographic/testHalf_TH_asr_ase")
+                          (DTM3.Model . thModelConfig "ASR_ASE_TestHalfPUMA_TH")
+                          (show . view GT.pUMA) cmdLine Nothing Nothing Nothing pumaTraining_C pumaTesting_C
+    (_, pumaSplitFullTH) <- K.ignoreCacheTime pumaTestSplitTH_C
+
+    pumaSplitMean_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
                        (DTP.viaOptimalWeights DTP.euclideanFull)
                        (Right "ASR_ASE_ByPUMA")
-                       (Right  "model/demographic/mean_asr_ase")
-                       True
-                       (show . view GT.pUMA) cmdLine Nothing Nothing byPUMA_C testPUMAs_C
-    (_, pumaMeanFull) <- K.ignoreCacheTime pumaTestMean_C
+                       (Right "model/demographic/mean_asr_ase")
+                       (const DTM3.Mean)
+                       (show . view GT.pUMA) cmdLine Nothing Nothing Nothing pumaTraining_C pumaTesting_C
+    (_, pumaSplitMean) <- K.ignoreCacheTime pumaSplitMean_C
 
+{-
     let aRE = DED.averagingMatrix @(F.Record DMC.ASRE) @(F.Record [DT.Race5C, DT.Education4C]) F.rcast
         mId :: LA.Matrix Double = LA.ident 200
     pumaTestAvgER_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
@@ -737,6 +804,7 @@ compareASR_ASE cmdLine postInfo = do
                         (show . view GT.pUMA) cmdLine (Just aRE) Nothing byPUMA_C testPUMAs_C
 
     (_, pumaModeledAvgER) <- K.ignoreCacheTime pumaTestAvgER_C
+-}
 {-
     let aSRE = DED.averagingMatrix @(F.Record DMC.ASRE) @(F.Record [DT.SexC, DT.Race5C, DT.Education4C]) F.rcast
         mPlus mSoFar mNew = mSoFar + mNew LA.<> (mId - mSoFar)
@@ -770,7 +838,7 @@ compareASR_ASE cmdLine postInfo = do
                                      (show . view GT.pUMA) cmdLine (Just mRE_SRE_ARE_ASRE) Nothing byPUMA_C testPUMAs_C
     (_, pumaModeledAvgER_SER_AER_ASER) <- K.ignoreCacheTime pumaTestAvgER_SER_AER_ASER_C
 -}
-
+{-
     let subsetER :: DT.Education4 -> DT.Race5 -> Set (F.Record [DT.Age5C, DT.SexC, DT.Education4C, DT.Race5C])
         subsetER e r = S.fromList $ [a F.&: s F.&: e F.&: r F.&: V.RNil | a <- S.toList Keyed.elements, s <- S.toList Keyed.elements]
         subsetsER = [subsetER e r | e <- S.toList Keyed.elements, r <- S.toList Keyed.elements]
@@ -782,7 +850,7 @@ compareASR_ASE cmdLine postInfo = do
                          False
                          (show . view GT.pUMA) cmdLine Nothing (Just subsetsER) byPUMA_C testPUMAs_C
     (_, pumaModeledOnlyER) <- K.ignoreCacheTime pumaTestOnlyER_C
-
+-}
     let raceOrder = show <$> S.toList (Keyed.elements @DT.Race5)
         ageOrder = show <$> S.toList (Keyed.elements @DT.Age5)
         pumaKey ok = (ok ^. GT.stateAbbreviation, ok ^. GT.pUMA)
@@ -797,6 +865,7 @@ compareASR_ASE cmdLine postInfo = do
 --    K.logLE K.Info $ "testPUMAs=" <> show testPUMASet
     pumaModelPaths <- postPaths "Model_ASR_ASE_ByPUMA" cmdLine
     BRK.brNewPost pumaModelPaths postInfo "Model_ASR_ASE_ByPUMA" $ do
+{-
       compareResults @(DMC.PUMAOuterKeyR V.++ DMC.ASER)
         pumaModelPaths postInfo False False "ASR_ASE" ("PUMA", pumaPopMap, pumaKey) Nothing --(Just "NY")
         (F.rcast @DMC.ASER)
@@ -818,6 +887,7 @@ compareASR_ASE cmdLine postInfo = do
         ,MethodResult (fmap F.rcast pumaModeledRaw) (Just "NS: Full") (Just "NS: Full") (Just "NS: Full")
 --        ,MethodResult (fmap F.rcast pumaMeanFull) (Just "NS: Mean Only") (Just "NS: Mean Only (L2)") (Just "NS: Mean Only")
         ]
+-}
       compareResults @(DMC.PUMAOuterKeyR V.++ DMC.ASER)
         pumaModelPaths postInfo False False "ASR_ASE" ("PUMA", pumaPopMap, pumaKey) Nothing --(Just "NY")
         (F.rcast @DMC.ASER)
@@ -831,13 +901,37 @@ compareASR_ASE cmdLine postInfo = do
         (fmap F.rcast $ testRowsWithZeros @DMC.PUMAOuterKeyR @DMC.ASER pumaTesting)
         [MethodResult (fmap F.rcast $ testRowsWithZeros @DMC.PUMAOuterKeyR @DMC.ASER pumaTesting) (Just "Actual") Nothing Nothing
         ,MethodResult (filterToTestPUMAs $ fmap F.rcast pumaSplitProduct) (Just "Product") (Just "Marginal Product") (Just "Product")
-        ,MethodResult (filterToTestPUMAs $ fmap F.rcast pumaModeledRaw) (Just "NS: Full") (Just "NS: Full") (Just "NS: Full")
+--        ,MethodResult (filterToTestPUMAs $ fmap F.rcast pumaRawFull) (Just "NS: Full") (Just "NS: Full") (Just "NS: Full")
         ,MethodResult (fmap F.rcast pumaSplitFull) (Just "NS: Split") (Just "NS: Split") (Just "NS: Split")
+        ,MethodResult (fmap F.rcast pumaSplitMean) (Just "NS: Split (Means)") (Just "NS: Split (Means)") (Just "NS: Split (Means)")
+        ,MethodResult (fmap F.rcast pumaSplitFull10) (Just "NS: Split (10%)") (Just "NS: Split (10%)") (Just "NS: Split (10%)")
+        ,MethodResult (fmap F.rcast pumaSplitFull50) (Just "NS: Split (50%)") (Just "NS: Split (50%)") (Just "NS: Split (50%)")
+        ,MethodResult (fmap F.rcast pumaSplitFull90) (Just "NS: Split (90%)") (Just "NS: Split (90%)") (Just "NS: Split (90%)")
+        ,MethodResult (fmap F.rcast pumaSplitFullTH) (Just "NS: Split (TH)") (Just "NS: Split (TH)") (Just "NS: Split (TH)")
         ]
-    pumaASERToCSV "True.csv" $ fmap F.rcast pumaTesting
-    pumaASERToCSV "Product.csv" $  F.filterFrame ((`S.member` testPUMASet) . pumaKey) $ fmap F.rcast pumaSplitProduct
-    pumaASERToCSV "NS.csv" $ fmap F.rcast pumaSplitFull
-
+    pumaASERToCSV "True_SplitTest.csv" $ fmap F.rcast pumaTesting
+    pumaASERToCSV "Product_SplitTest.csv" $  F.filterFrame ((`S.member` testPUMASet) . pumaKey) $ fmap F.rcast pumaSplitProduct
+    pumaASERToCSV "NS_SplitTest.csv" $ fmap F.rcast pumaSplitFull
+    testPUMAs <- K.ignoreCacheTime testPUMAs_C
+    pumaASERToCSV "True_Full.csv" $ fmap F.rcast testPUMAs
+    pumaASERToCSV "Product_Full.csv" $  fmap F.rcast pumaProduct
+    pumaASERToCSV "NS_Full.csv" $ fmap F.rcast pumaModeledRaw
+    let ms = DMC.marginalStructure @DMC.ASER @DMC.ASR @DMC.ASE @DMS.CellWithDensity @DMC.AS DMS.cwdWgtLens DMS.innerProductCWD'
+        nullVecs = DTP.nullVecsMS ms
+        covFld :: FL.Fold (F.Record (DMC.ASER V.++ '[DT.PopCount, DT.PWPopPerSqMile])) [Double]
+        covFld = fmap VS.toList $ DMC.innerFoldWD (F.rcast @DMC.ASR) (F.rcast @DMC.ASE)
+        popVecFld = DED.vecFld getSum (Sum . realToFrac . view DT.popCount) (F.rcast @DMC.ASER)
+        popFld = FL.premap (realToFrac . view DT.popCount) FL.sum
+        safeDiv x y = if y /= 0 then x / y else 0
+        alphaFld = (\p -> VS.toList . DTP.fullToProj nullVecs . VS.map (flip safeDiv p)) <$> popFld <*> popVecFld
+        alphaCovInner k = (\as cs -> AlphaCov (k ^. GT.stateAbbreviation) (k ^. GT.pUMA) as cs) <$> alphaFld <*> covFld
+        alphaCovFld :: FL.Fold (F.Record (DMC.PUMARowR DMC.ASER)) [AlphaCov]
+        alphaCovFld = MR.mapReduceFold
+                      MR.noUnpack
+                      (MR.assign (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @(DMC.ASER V.++ '[DT.PopCount, DT.PWPopPerSqMile])))
+                      (MR.ReduceFold alphaCovInner)
+        alphaCovs = FL.fold alphaCovFld testPUMAs
+    K.liftKnit $ writeAlphaCovs 120 91 "../../forPhilip/alphaCovs.csv" alphaCovs
 
 
 
@@ -850,7 +944,7 @@ compareASR_ASE cmdLine postInfo = do
                                  (DTP.viaOptimalWeights DTP.euclideanFull)
                                  (Right "ASR_ASE_ByPUMA")
                                  (Right "model/demographic/asr_ase")
-                                 DDP.districtKeyT cmdLine Nothing byPUMA_C testCDs_C
+                                 DDP.districtKeyT cmdLine Nothing Nothing Nothing byPUMA_C testCDs_C
     cdFromPUMAModeledAvgSE_C <- DDP.cachedPUMAsToCDs @DMC.ASER "model/demographic/asr_ase_AvgSE_CDFromPUMA.bin" $ fmap snd pumaTestAvgSE_C
     cdFromPUMAModeledAvgSE <- K.ignoreCacheTime cdFromPUMAModeledAvgSE_C
 
@@ -859,7 +953,7 @@ compareASR_ASE cmdLine postInfo = do
                            (DTP.viaOptimalWeights DTP.euclideanFull)
                            (Right "ASR_ASE_ByPUMA")
                            (Right "model/demographic/asr_ase_AvgSE")
-                           DDP.districtKeyT cmdLine (Just avgSE) byPUMA_C testCDs_C
+                           DDP.districtKeyT cmdLine (Just avgSE) Nothing Nothing byPUMA_C testCDs_C
 
     cdModelPaths <- postPaths "Model_ASR_ASE_ByCD" cmdLine
     BRCC.brNewPost cdModelPaths postInfo "Model_ASR_ASE_ByCD" $ do
@@ -900,8 +994,8 @@ compareCASR_ASE cmdLine postInfo = do
                                           (DTP.viaOptimalWeights DTP.euclideanFull)
                                           (Right "CASR_ASE_ByPUMA")
                                           (Right "model/demographic/casr_ase")
-                                          False
-                                          (show . view GT.pUMA) cmdLine Nothing Nothing byPUMA_C testPUMAs_C
+                                          (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
+                                          (show . view GT.pUMA) cmdLine Nothing Nothing Nothing byPUMA_C testPUMAs_C
 
 {-
     (product_CSR_ASR', modeled_CSR_ASR') <- K.ignoreCacheTimeM
@@ -935,6 +1029,7 @@ compareCASR_ASE cmdLine postInfo = do
 --        ,MethodResult (fmap F.rcast modeled_CSR_ASR') (Just "NS Model (Yi/Chen)") (Just "NS Model (Yi/Chen)") (Just "NS Model (Yi/Chen)")
         ]
 
+{-
 compareSER_ASR :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareSER_ASR cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for SER x A6SR -> A6SER"
@@ -949,7 +1044,7 @@ compareSER_ASR cmdLine postInfo = do
                                             (DTP.viaOptimalWeights DTP.euclideanFull)
                                             (Right "SER_ASR")
                                             (Right "model/demographic/ser_asr")
-                                            False
+                                            (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
                                             DDP.districtKeyT cmdLine Nothing Nothing byPUMA_C byCD_C
     let raceOrder = show <$> S.toList (Keyed.elements @DT.Race5)
         ageOrder = show <$> S.toList (Keyed.elements @DT.Age5)
@@ -989,7 +1084,7 @@ compareSER_ASR cmdLine postInfo = do
         ,MethodResult (fmap F.rcast modeled_SER_ASR) (Just "NS Model") (Just "NS Model") (Just "NS Model")
         ]
     pure ()
-
+-}
 main :: IO ()
 main = do
   cmdLine ← CmdArgs.cmdArgsRun BR.commandLine
@@ -1131,6 +1226,24 @@ pumaASERToCSV fileName rows = do
     $ FCSV.foldableToStream
     $ fmap F.rcast rows
 
+
+
+data AlphaCov = AlphaCov { acState :: Text, acPUMA :: Int, acAlphas :: [Double], acCovs :: [Double] }
+
+alphaCovHeader :: Int -> Int -> Text
+alphaCovHeader nAlpha nCov = "state_abbreviation, PUMA, " <> headers "alpha" nAlpha <> ", " <> headers "cov" nCov
+  where
+    headers t n = T.intercalate ", " $ fmap (\m -> t <> show m) [0..n]
+
+alphaCovRow :: AlphaCov -> Text
+alphaCovRow (AlphaCov sa p as cs) = T.intercalate ", " $ [sa, show p] <> fmap (toText @String . PF.printf "%2.2g") (as <> cs)
+
+
+writeAlphaCovs :: Foldable f => Int -> Int -> FilePath -> f AlphaCov -> IO ()
+writeAlphaCovs nAlpha nCov fp acs = sWriteTextLines fp (FSS.StreamlyStream s)
+  where
+    valueStream :: Streamly.Stream IO Text = fmap alphaCovRow $ FSS.stream $ sFromFoldable acs
+    s :: Streamly.Stream IO Text = alphaCovHeader nAlpha nCov `Streamly.cons` valueStream
 
 shiroData :: (K.KnitEffects r, BRCC.CacheEffects r) => K.Sem r ()
 shiroData = do
