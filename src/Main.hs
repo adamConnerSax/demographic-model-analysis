@@ -655,7 +655,7 @@ compareCSR_ASR cmdLine postInfo = do
 
 --    byPUMA <- K.ignoreCacheTime byPUMA_C
     pumaTest_C <- testNS @DMC.PUMAOuterKeyR @DMC.CASR @'[DT.CitizenC] @'[DT.Age5C]
-                  (DTP.viaOptimalWeights DTP.euclideanFull)
+                  (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
                   (Right "CSR_ASR_ByPUMA")
                   (Right "model/demographic/csr_asr_PUMA")
                   (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
@@ -699,7 +699,7 @@ compareCSR_ASR cmdLine postInfo = do
 
     (cdProduct, cdModeled) <- K.ignoreCacheTimeM
                               $ testNS @DMC.CDOuterKeyR @DMC.CASR @'[DT.CitizenC] @'[DT.Age5C]
-                              (DTP.viaOptimalWeights DTP.euclideanFull)
+                              (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
                               (Right "CSR_ASR_ByPUMA")
                               (Right "model/demographic/csr_asr_PUMA")
                               (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
@@ -756,7 +756,7 @@ labeledToProdMatFld wl ms ok ik f = fmap LA.fromColumns
                                     $ MR.mapReduceFold
                                     MR.noUnpack
                                     (MR.assign ok (\x -> (ik x, f x)))
-                                    (MR.ReduceFold $ const $ vecFld)
+                                    (MR.ReduceFold $ const vecFld)
   where
     vecFld = fmap (VS.fromList . fmap (view wl) . M.elems . FL.fold DMS.zeroFillSummedMapFld) $ DMS.msProdFld ms
 --    normFld = FL.premap (view wl . snd) FL.sum
@@ -764,6 +764,12 @@ labeledToProdMatFld wl ms ok ik f = fmap LA.fromColumns
 
 totalDeviation :: LA.Vector Double -> LA.Vector Double -> Double
 totalDeviation v1 v2 = (VS.sum $ VS.map abs $ VS.zipWith (-) v1 v2) / 2
+
+addToAll :: Double -> LA.Vector Double -> LA.Vector Double
+addToAll x = VS.map (+ x)
+
+jitter :: Int -> LA.Vector Double -> LA.Vector Double
+jitter m = addToAll (1 / realToFrac (m * m))
 
 newtype FlatMatrix = FlatMatrix { matrix :: LA.Matrix Double }
 instance Flat.Flat FlatMatrix where
@@ -779,28 +785,39 @@ asrASE_average_stuff = do
   (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
                                      $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.pUMA)) testPUMAs_C
   testPUMAs <- K.ignoreCacheTime testPUMAs_C
-  let ms = DMC.marginalStructure @DMC.ASER @DMC.ASR @DMC.ASE @DMS.CellWithDensity @DMC.AS DMS.cwdWgtLens DMS.innerProductCWD'
-  nullVecs <- K.knitMaybe "asrASE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
-              $  DTP.nullVecsMS ms Nothing
+  let ms = DMC.marginalStructure @DMC.ASER  @'[DT.Race5C] @'[DT.Education4C] @DMS.CellWithDensity @DMC.AS DMS.cwdWgtLens DMS.innerProductCWD'
+  nullVecsSVD <- K.knitMaybe "asrASE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
+                 $  DTP.nullVecsMS ms Nothing
+
+
+  let catMapASER :: DNS.CatMap (F.Record DMC.ASER) = DNS.mkCatMap [('A', S.size $ Keyed.elements @DT.Age5)
+                                                                , ('S', S.size $ Keyed.elements @DT.Sex)
+                                                                , ('E', S.size $ Keyed.elements @DT.Education4)
+                                                                , ('R', S.size $ Keyed.elements @DT.Race5)
+                                                                ]
+      catAndKnownASR_ASE :: DNS.CatsAndKnowns (F.Record DMC.ASER) = DNS.CatsAndKnowns catMapASER
+                                                                    [DNS.KnownMarginal "ASR", DNS.KnownMarginal "ASE"]
+  nullVecsTensor <- K.knitMaybe "aseASE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
+                    $  DTP.nullVecsMS ms (Just catAndKnownASR_ASE)
   let covFld :: FL.Fold (F.Record (DMC.ASER V.++ '[DT.PopCount, DT.PWPopPerSqMile])) [Double]
       covFld = fmap VS.toList $ DMC.innerFoldWD (F.rcast @DMC.ASR) (F.rcast @DMC.ASE)
       popVecFld = DED.vecFld getSum (Sum . realToFrac . view DT.popCount) (F.rcast @DMC.ASER)
       popFld = FL.premap (realToFrac . view DT.popCount) FL.sum
       safeDiv x y = if y /= 0 then x / y else 0
-      alphaFld = (\p -> VS.toList . DTP.fullToProj nullVecs . VS.map (flip safeDiv p)) <$> popFld <*> popVecFld
-      alphaCovInner k = (\as cs -> AlphaCov (k ^. GT.stateAbbreviation) (k ^. GT.pUMA) as cs) <$> alphaFld <*> covFld
-      alphaCovFld :: FL.Fold (F.Record (DMC.PUMARowR DMC.ASER)) [AlphaCov]
-      alphaCovFld = MR.mapReduceFold
-                    MR.noUnpack
-                    (MR.assign (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @(DMC.ASER V.++ '[DT.PopCount, DT.PWPopPerSqMile])))
-                    (MR.ReduceFold alphaCovInner)
-      alphaCovs = FL.fold alphaCovFld testPUMAs
+      alphaFld nv = (\p -> VS.toList . DTP.fullToProj nv . VS.map (flip safeDiv p)) <$> popFld <*> popVecFld
+      alphaCovInner nv k = (\as cs -> AlphaCov (k ^. GT.stateAbbreviation) (k ^. GT.pUMA) as cs) <$> alphaFld nv <*> covFld
+      alphaCovFld ::  DTP.NullVectorProjections (F.Record DMC.ASER) -> FL.Fold (F.Record (DMC.PUMARowR DMC.ASER)) [AlphaCov]
+      alphaCovFld nv = MR.mapReduceFold
+                       MR.noUnpack
+                       (MR.assign (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @(DMC.ASER V.++ '[DT.PopCount, DT.PWPopPerSqMile])))
+                       (MR.ReduceFold $ alphaCovInner nv)
+      alphaCovs nv = FL.fold (alphaCovFld nv) testPUMAs
 
 --  K.liftKnit $ writeAlphaCovs 120 91 "../../forPhilip/alphaCovs.csv" alphaCovs
   let avgAlphaFld n = FL.premap (\ac -> acAlphas ac List.!! n) FL.mean
       avgAlphasFld = fmap VS.fromList $ traverse avgAlphaFld [0..119]
-      avgAlphas = FL.fold avgAlphasFld alphaCovs
-      avgChange = zip (S.toList $ Keyed.elements @(F.Record DMC.ASER)) $ VS.toList $ DTP.projToFull nullVecs avgAlphas
+      avgAlphas nv = FL.fold avgAlphasFld $ alphaCovs nv
+      avgChange nv = zip (S.toList $ Keyed.elements @(F.Record DMC.ASER)) $ VS.toList $ DTP.projToFull nv $ avgAlphas nv
       showKey k = T.intercalate ", " $ [show (k ^. DT.age5C), show (k ^. DT.sexC), show (k ^. DT.education4C), show (k ^. DT.race5C)]
 {-  K.liftKnit @IO
     $ sWriteTextLines "../../forPhilip/change.csv"
@@ -831,12 +848,14 @@ asrASE_average_stuff = do
       pumasToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @DMC.ASER) DTM3.cwdF
   (pumasTM, pumaProductsTM) <- fmap (first matrix . second matrix)
                                $ K.ignoreCacheTimeM
-                               $ BRCC.retrieveOrMakeD "test/pumaMatricesTesting.bin" pumaTesting_C $ \x -> do
+                               $ BRCC.retrieveOrMakeD "test/ASR_ASE/pumaMatricesTesting.bin" pumaTesting_C $ \x -> do
+    K.logLE K.Info "(Re)building Testing PUMA data"
     let (pumas, products) = FL.fold ((,) <$> pumasToMatFld <*> pumasToProdMatFld) x
     pure $ (FlatMatrix pumas, FlatMatrix products)
   (pumasTrM, pumaProductsTrM) <- fmap (first matrix . second matrix)
                                $ K.ignoreCacheTimeM
-                               $ BRCC.retrieveOrMakeD "test/pumaMatricesTraining.bin" pumaTraining_C $ \x -> do
+                               $ BRCC.retrieveOrMakeD "test/ASR_ASE/pumaMatricesTraining.bin" pumaTraining_C $ \x -> do
+    K.logLE K.Info "(Re)building Training PUMA data"
     let (pumas, products) = FL.fold ((,) <$> pumasToMatFld <*> pumasToProdMatFld) x
     pure $ (FlatMatrix pumas, FlatMatrix products)
 
@@ -844,40 +863,70 @@ asrASE_average_stuff = do
 --  K.logLE K.Info $ toText $ LA.dispf 4 pumaProductsM
 
 --      pumaProductsM = FL.fold pumasToProdMatFld testPUMAs
-  let totalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns pumaProductsTM)
-      avgDeviation = FL.fold FL.mean totalDeviations
+  let totalDeviations x = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns x)
+      avgDeviation x = FL.fold FL.mean $ totalDeviations x
       nPUMA = LA.cols pumasTM
   K.logLE K.Info $ "N_puma=" <> show nPUMA
-  K.logLE K.Info $ "avg deviation=" <> show avgDeviation
+  K.logLE K.Info $ "Product: avg deviation=" <> show (avgDeviation pumaProductsTM)
   let diffs = pumasTrM - pumaProductsTrM
-      alphas = DTP.fullToProjM nullVecs LA.<> diffs
-      (meanAlpha, covAlpha) = LA.meanCov $ LA.tr alphas
-  K.logLE K.Info $ "alphas=" <> DED.prettyVector meanAlpha
---  K.logLE K.Info $ "alpha covs=" <> (toText $ LA.disps 4 $ LA.unSym covAlpha)
-  let prodAvgAlpha = pumaProductsTM + LA.fromColumns (replicate nPUMA $ DTP.projToFullM nullVecs LA.#> meanAlpha)
-      aaTotalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns prodAvgAlpha)
-      avgAADeviation = FL.fold FL.mean aaTotalDeviations
-  K.logLE K.Info $ "avg AA deviation=" <> show avgAADeviation
-  let aaOS = LA.fromColumns $ fmap DTP.projectToSimplex $ LA.toColumns prodAvgAlpha
-      aaOsTotalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns aaOS)
-      avgAAOSDeviation = FL.fold FL.mean aaOsTotalDeviations
-  K.logLE K.Info $ "avg AAOS deviation=" <> show avgAAOSDeviation
-  K.logLE K.Info $ "doing full vector optimization"
-  let optimizerData = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOS)
-      optimize (p, t) = DED.mapPE $ DTP.optimalVector nullVecs p t
-  aaOV <- LA.fromColumns <$> traverse optimize optimizerData
-  let aaOVTD = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns aaOV)
-      avgAAOVDeviation = FL.fold FL.mean aaOVTD
-  K.logLE K.Info $ "avg AAOV deviation=" <> show avgAAOVDeviation
-  K.logLE K.Info $ "doing weight vector optimization"
-  let owOptimizerData = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlpha)
-      owOptimize (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull nullVecs aV pV
-  aaOW' <- LA.fromColumns <$> traverse owOptimize owOptimizerData
-  let aaOW = pumaProductsTM + DTP.projToFullM nullVecs LA.<> aaOW'
-  let aaOWTD = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns aaOW)
-      avgAAOWDeviation = FL.fold FL.mean aaOWTD
-  K.logLE K.Info $ "avg AAOW deviation=" <> show avgAAOWDeviation
+      alphas nv = DTP.fullToProjM nv LA.<> diffs
+      (meanAlphaSVD, covAlphaSVD) = LA.meanCov $ LA.tr $ alphas nullVecsSVD
+      (meanAlphaTensor, covAlphaTensor) = LA.meanCov $ LA.tr $ alphas nullVecsTensor
 
+  K.logLE K.Info $ "SVD alphas=" <> DED.prettyVector meanAlphaSVD
+  K.logLE K.Info $ "Tensor alphas=" <> DED.prettyVector meanAlphaTensor
+--  K.logLE K.Info $ "alpha covs=" <> (toText $ LA.disps 4 $ LA.unSym covAlpha)
+  let prodAvgAlphaSVD = pumaProductsTM + LA.fromColumns (replicate nPUMA $ DTP.projToFullM nullVecsSVD LA.#> meanAlphaSVD)
+--      aaTotalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns prodAvgAlpha)
+--      avgAADeviation = FL.fold FL.mean aaTotalDeviations
+  K.logLE K.Info $ "SVD Mean alpha: avg deviation=" <> show (avgDeviation prodAvgAlphaSVD) --avgAADeviation
+  let prodAvgAlphaTensor = pumaProductsTM + LA.fromColumns (replicate nPUMA $ DTP.projToFullM nullVecsTensor LA.#> meanAlphaTensor)
+  K.logLE K.Info $ "Tensor Mean alpha: avg deviation=" <> show (avgDeviation prodAvgAlphaTensor) --avgAADeviation
+
+  let aaOSSVD = LA.fromColumns $ fmap DTP.projectToSimplex $ LA.toColumns prodAvgAlphaSVD
+      aaOSTensor = LA.fromColumns $ fmap DTP.projectToSimplex $ LA.toColumns prodAvgAlphaTensor
+--      aaOsTotalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns aaOS)
+--      avgAAOSDeviation = FL.fold FL.mean aaOsTotalDeviations
+  K.logLE K.Info $ "SVD: avg AAOS deviation=" <> show (avgDeviation aaOSSVD)
+  K.logLE K.Info $ "Tensor: avg AAOS deviation=" <> show (avgDeviation aaOSTensor)
+  K.logLE K.Info $ "Weight vector optimization via Active Set"
+  let toJoint nv alphas = pumaProductsTM + DTP.projToFullM nv LA.<> alphas
+      owOptimizerDataSVD = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlphaSVD)
+      asOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeightsAS (DTP.defaultActiveSetConfig { DTP.asSolver = DTP.SolveSVD }) Nothing nV aV pV
+--  aaASTensor <- LA.fromColumns <$> (traverse (asOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
+  aaASSVD <- LA.fromColumns <$> (traverse (asOptimize nullVecsSVD) $ owOptimizerDataSVD)
+--  K.logLE K.Info $ "avg Tensor AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaASTensor)
+  K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
+
+{-  K.logLE K.Info $ "doing full vector optimization"
+  let optimizerDataSVD = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSSVD)
+      optimizerDataTensor = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSTensor)
+      optimize nv (p, t) = DED.mapPE $ DTP.optimalVector nv p t
+  aaOVSVD <- LA.fromColumns <$> traverse (optimize nullVecsSVD) optimizerDataSVD
+  aaOVTensor <- LA.fromColumns <$> traverse (optimize nullVecsTensor) optimizerDataTensor
+  K.logLE K.Info $ "SVD: avg AAOV deviation=" <> show (avgDeviation aaOVSVD)
+  K.logLE K.Info $ "Tensor: avg AAOV deviation=" <> show (avgDeviation aaOVTensor)
+-}
+  K.logLE K.Info $ "doing weight vector optimization"
+  let owOptimizerDataTensor = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlphaTensor)
+      owOptimize nv (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nv aV pV
+{-  aaOWSVD' <- LA.fromColumns <$> traverse (owOptimize nullVecsSVD) owOptimizerDataSVD
+  aaOWTensor' <- LA.fromColumns <$> traverse (owOptimize nullVecsTensor) owOptimizerDataTensor
+  let aaOWSVD = pumaProductsTM + DTP.projToFullM nullVecsSVD LA.<> aaOWSVD'
+  let aaOWTensor = pumaProductsTM + DTP.projToFullM nullVecsTensor LA.<> aaOWTensor'
+  K.logLE K.Info $ "SVD: avg AAOW deviation=" <> show (avgDeviation aaOWSVD)
+  K.logLE K.Info $ "Tensor: avg AAOW deviation=" <> show (avgDeviation aaOWTensor)
+-}
+  K.logLE K.Info $ "doing weight vector optimization, invWeight"
+  let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nV aV pV
+      tryF t f = do
+        aaIWSVD <- LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) owOptimizerDataSVD)
+        K.logLE K.Info $ "avg SVD AAIW deviation (f is " <> t <> ")=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaIWSVD)
+--  tryF "-log x" (negate . Numeric.log)
+--  tryF "1/x" (\x -> 1/x)
+--  tryF "x^(-0.75)" (\x -> x ** (-0.75))
+  tryF "1/sqrt(x)" (\x -> 1/sqrt x)
+--  tryF "x^(-0.25)" (\x -> x ** (-0.25))
 
 --      totalDev
   pure ()
@@ -892,28 +941,38 @@ asAE_average_stuff = do
   (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
                                      $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.pUMA)) testPUMAs_C
   testPUMAs <- K.ignoreCacheTime testPUMAs_C
-  let ms = DMC.marginalStructure @DMC.ASE @DMC.AS @DMC.AE @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD'
-  nullVecs <- K.knitMaybe "asrASE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
-              $  DTP.nullVecsMS ms Nothing
+  let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD'
+  nullVecsSVD <- K.knitMaybe "asAE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
+                 $  DTP.nullVecsMS ms Nothing
+
+  let catMapASE :: DNS.CatMap (F.Record DMC.ASE) = DNS.mkCatMap [('A', S.size $ Keyed.elements @DT.Age5)
+                                                            , ('S', S.size $ Keyed.elements @DT.Sex)
+                                                            , ('E', S.size $ Keyed.elements @DT.Education4)
+                                                            ]
+      catAndKnownAS_AE :: DNS.CatsAndKnowns (F.Record DMC.ASE) = DNS.CatsAndKnowns catMapASE
+                                                                 [DNS.KnownMarginal "AS", DNS.KnownMarginal "AE"]
+  nullVecsTensor <- K.knitMaybe "asAE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
+                    $  DTP.nullVecsMS ms (Just catAndKnownAS_AE)
+
   let covFld :: FL.Fold (F.Record (DMC.ASE V.++ '[DT.PopCount, DT.PWPopPerSqMile])) [Double]
       covFld = fmap VS.toList $ DMC.innerFoldWD (F.rcast @DMC.AS) (F.rcast @DMC.AE)
       popVecFld = DED.vecFld getSum (Sum . realToFrac . view DT.popCount) (F.rcast @DMC.ASE)
       popFld = FL.premap (realToFrac . view DT.popCount) FL.sum
       safeDiv x y = if y /= 0 then x / y else 0
-      alphaFld = (\p -> VS.toList . DTP.fullToProj nullVecs . VS.map (flip safeDiv p)) <$> popFld <*> popVecFld
-      alphaCovInner k = (\as cs -> AlphaCov (k ^. GT.stateAbbreviation) (k ^. GT.pUMA) as cs) <$> alphaFld <*> covFld
-      alphaCovFld :: FL.Fold (F.Record (DMC.PUMARowR DMC.ASE)) [AlphaCov]
-      alphaCovFld = MR.mapReduceFold
-                    MR.noUnpack
-                    (MR.assign (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @(DMC.ASE V.++ '[DT.PopCount, DT.PWPopPerSqMile])))
-                    (MR.ReduceFold alphaCovInner)
-      alphaCovs = FL.fold alphaCovFld testPUMAs
+      alphaFld nv = (\p -> VS.toList . DTP.fullToProj nv . VS.map (flip safeDiv p)) <$> popFld <*> popVecFld
+      alphaCovInner nv k = (\as cs -> AlphaCov (k ^. GT.stateAbbreviation) (k ^. GT.pUMA) as cs) <$> alphaFld nv <*> covFld
+      alphaCovFld :: DTP.NullVectorProjections (F.Record DMC.ASE) -> FL.Fold (F.Record (DMC.PUMARowR DMC.ASE)) [AlphaCov]
+      alphaCovFld nv = MR.mapReduceFold
+                       MR.noUnpack
+                       (MR.assign (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @(DMC.ASE V.++ '[DT.PopCount, DT.PWPopPerSqMile])))
+                       (MR.ReduceFold $ alphaCovInner nv)
+      alphaCovs nv = FL.fold (alphaCovFld nv) testPUMAs
 
   let avgAlphaFld n = FL.premap (\ac -> acAlphas ac List.!! n) FL.mean
       avgAlphasFld = fmap VS.fromList $ traverse avgAlphaFld [0..119]
-      avgAlphas = FL.fold avgAlphasFld alphaCovs
-      avgChange = zip (S.toList $ Keyed.elements @(F.Record DMC.ASE)) $ VS.toList $ DTP.projToFull nullVecs avgAlphas
-      showKey k = T.intercalate ", " $ [show (k ^. DT.age5C), show (k ^. DT.sexC), show (k ^. DT.education4C), show (k ^. DT.race5C)]
+      avgAlphas nv = FL.fold avgAlphasFld $ alphaCovs nv
+      avgChange nv = zip (S.toList $ Keyed.elements @(F.Record DMC.ASE)) $ VS.toList $ DTP.projToFull nv (avgAlphas nv)
+      showKey k = T.intercalate ", " $ [show (k ^. DT.age5C), show (k ^. DT.sexC), show (k ^. DT.education4C)]
   K.logLE K.Info $ "Computing total deviation of products..."
   let pumasToMatFld :: FL.Fold (F.Record (DMC.PUMARowR DMC.ASE)) (LA.Matrix Double)
       pumasToMatFld = labeledToMatFld (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @DMC.ASE) (realToFrac . view DT.popCount)
@@ -921,54 +980,106 @@ asAE_average_stuff = do
       pumasToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @[GT.StateAbbreviation, GT.PUMA]) (F.rcast @DMC.ASE) DTM3.cwdF
   (pumasTM, pumaProductsTM) <- fmap (first matrix . second matrix)
                                $ K.ignoreCacheTimeM
-                               $ BRCC.retrieveOrMakeD "test/as_ae/pumaMatricesTesting.bin" pumaTesting_C $ \x -> do
+                               $ BRCC.retrieveOrMakeD "test/AS_AE/pumaMatricesTesting.bin" pumaTesting_C $ \x -> do
     let (pumas, products) = FL.fold ((,) <$> pumasToMatFld <*> pumasToProdMatFld) x
     pure $ (FlatMatrix pumas, FlatMatrix products)
   (pumasTrM, pumaProductsTrM) <- fmap (first matrix . second matrix)
                                $ K.ignoreCacheTimeM
-                               $ BRCC.retrieveOrMakeD "test/as_ae/pumaMatricesTraining.bin" pumaTraining_C $ \x -> do
+                               $ BRCC.retrieveOrMakeD "test/AS_AE/pumaMatricesTraining.bin" pumaTraining_C $ \x -> do
     let (pumas, products) = FL.fold ((,) <$> pumasToMatFld <*> pumasToProdMatFld) x
     pure $ (FlatMatrix pumas, FlatMatrix products)
+  (pumasJTrM, pumaProductsJTrM) <- fmap (first matrix . second matrix)
+                                   $ K.ignoreCacheTimeM
+                                   $ BRCC.retrieveOrMakeD "test/AS_AE/pumaJMatricesTraining.bin" pumaTraining_C $ \x -> do
+    let (pumas, products) = FL.fold ((,) <$> pumasToMatFld <*> pumasToProdMatFld) x
+        jitterVec r =
+          let
+            v = addToAll 100 r
+            s = VS.sum v / VS.sum r
+          in VS.map (/ s) v
+        jitterRows = LA.fromRows . fmap jitterVec . LA.toRows
+    pure $ (FlatMatrix $ jitterRows pumas, FlatMatrix $ jitterRows products)
 
 --  K.logLE K.Info $ toText $ LA.dispf 4 pumasM
 --  K.logLE K.Info $ toText $ LA.dispf 4 pumaProductsM
 
 --      pumaProductsM = FL.fold pumasToProdMatFld testPUMAs
-  let totalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns pumaProductsTM)
-      avgDeviation = FL.fold FL.mean totalDeviations
+  let totalDeviations x = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns x)
+      avgDeviation x = FL.fold FL.mean $ totalDeviations x
       nPUMA = LA.cols pumasTM
   K.logLE K.Info $ "N_puma=" <> show nPUMA
-  K.logLE K.Info $ "avg deviation=" <> show avgDeviation
+  K.logLE K.Info $ "avg deviation=" <> show (avgDeviation pumaProductsTM)
   let diffs = pumasTrM - pumaProductsTrM
-      alphas = DTP.fullToProjM nullVecs LA.<> diffs
-      (meanAlpha, covAlpha) = LA.meanCov $ LA.tr alphas
-  K.logLE K.Info $ "alphas=" <> DED.prettyVector meanAlpha
---  K.logLE K.Info $ "alpha covs=" <> (toText $ LA.disps 4 $ LA.unSym covAlpha)
-  let prodAvgAlpha = pumaProductsTM + LA.fromColumns (replicate nPUMA $ DTP.projToFullM nullVecs LA.#> meanAlpha)
-      aaTotalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns prodAvgAlpha)
-      avgAADeviation = FL.fold FL.mean aaTotalDeviations
-  K.logLE K.Info $ "avg AA deviation=" <> show avgAADeviation
-  let aaOS = LA.fromColumns $ fmap DTP.projectToSimplex $ LA.toColumns prodAvgAlpha
-      aaOsTotalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns aaOS)
-      avgAAOSDeviation = FL.fold FL.mean aaOsTotalDeviations
-  K.logLE K.Info $ "avg AAOS deviation=" <> show avgAAOSDeviation
+      alphasSVD = DTP.fullToProjM nullVecsSVD LA.<> diffs
+      (meanAlphaSVD, covAlphaSVD) = LA.meanCov $ LA.tr alphasSVD
+  K.logCat "AlphaMismatch" K.Diagnostic $ "SVD null-space basis (cols):" <> toText (LA.disps 4 (LA.tr $ DTP.fullToProjM nullVecsSVD))
+  K.logLE K.Info $ "SVD alphas=" <> DED.prettyVector meanAlphaSVD
+  K.logLE K.Info $ "SVD alpha covs=" <> (toText $ LA.disps 4 $ LA.unSym covAlphaSVD)
+  let alphasTensor = DTP.fullToProjM nullVecsTensor LA.<> diffs
+      (meanAlphaTensor, covAlphaTensor) = LA.meanCov $ LA.tr alphasTensor
+  K.logCat "AlphaMismatch" K.Diagnostic $ "Tensor null-space basis (cols):" <> toText (LA.disps 4 (LA.tr $ DTP.fullToProjM nullVecsTensor))
+  K.logLE K.Info $ "Tensor alphas=" <> DED.prettyVector meanAlphaTensor
+  K.logLE K.Info $ "Tensor alpha covs=" <> (toText $ LA.disps 4 $ LA.unSym covAlphaTensor)
+  let alphasJSVD = DTP.fullToProjM nullVecsSVD LA.<> (pumasJTrM - pumaProductsJTrM)
+      (meanAlphaJSVD, covJAlphaSVD) = LA.meanCov $ LA.tr alphasJSVD
+      prodAvgAlphaSVD = pumaProductsTM + LA.fromColumns (replicate nPUMA $ DTP.projToFullM nullVecsSVD LA.#> meanAlphaSVD)
+      prodAvgAlphaTensor = pumaProductsTM + LA.fromColumns (replicate nPUMA $ DTP.projToFullM nullVecsTensor LA.#> meanAlphaTensor)
+      prodAvgAlphaJSVD = pumaProductsTM + LA.fromColumns (replicate nPUMA $ DTP.projToFullM nullVecsSVD LA.#> meanAlphaJSVD)
+--      aaTotalDeviations = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns prodAvgAlpha)
+      avgAADeviationSVD  = FL.fold FL.mean $ totalDeviations prodAvgAlphaSVD --aaTotalDeviations
+      avgAADeviationJSVD  = FL.fold FL.mean $ totalDeviations prodAvgAlphaJSVD --aaTotalDeviations
+      avgAADeviationTensor  = FL.fold FL.mean $ totalDeviations prodAvgAlphaTensor --aaTotalDeviations
+  K.logLE K.Info $ "SVD: avg AA deviation=" <> show avgAADeviationSVD
+  K.logLE K.Info $ "JSVD: avg AA deviation=" <> show avgAADeviationJSVD
+  K.logLE K.Info $ "Tensor: avg AA deviation=" <> show avgAADeviationTensor
+
+  let aaOSSVD = LA.fromColumns $ fmap DTP.projectToSimplex $ LA.toColumns prodAvgAlphaSVD
+      aaOSJSVD = LA.fromColumns $ fmap DTP.projectToSimplex $ LA.toColumns prodAvgAlphaJSVD
+      avgAAOSDeviationSVD = FL.fold FL.mean $ totalDeviations aaOSSVD
+      avgAAOSDeviationJSVD = FL.fold FL.mean $ totalDeviations aaOSJSVD
+      aaOSTensor = LA.fromColumns $ fmap DTP.projectToSimplex $ LA.toColumns prodAvgAlphaTensor
+      avgAAOSDeviationTensor = FL.fold FL.mean $ totalDeviations aaOSTensor
+  K.logLE K.Info $ "SVD: avg AAOS deviation=" <> show avgAAOSDeviationSVD
+  K.logLE K.Info $ "JSVD: avg AAOS deviation=" <> show avgAAOSDeviationJSVD
+  K.logLE K.Info $ "Tensor: avg AAOS deviation=" <> show avgAAOSDeviationTensor
   K.logLE K.Info $ "doing full vector optimization"
-  let optimizerData = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOS)
-      optimize (p, t) = DED.mapPE $ DTP.optimalVector nullVecs p t
-  aaOV <- LA.fromColumns <$> traverse optimize optimizerData
-  let aaOVTD = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns aaOV)
-      avgAAOVDeviation = FL.fold FL.mean aaOVTD
-  K.logLE K.Info $ "avg AAOV deviation=" <> show avgAAOVDeviation
+  let optimize nv (p, t) = DED.mapPE $ DTP.optimalVector nv p t
+      optimizerDataSVD = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSSVD)
+  aaOVSVD <- LA.fromColumns <$> traverse (optimize nullVecsSVD) optimizerDataSVD
+  let avgAAOVDeviationSVD = FL.fold FL.mean $ totalDeviations aaOVSVD
+  K.logLE K.Info $ "SVD: avg AAOV deviation=" <> show avgAAOVDeviationSVD
+  let optimizerDataTensor = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSTensor)
+  aaOVTensor <- LA.fromColumns <$> traverse (optimize nullVecsTensor) optimizerDataTensor
+  let avgAAOVDeviationTensor = FL.fold FL.mean $ totalDeviations aaOVTensor
+  K.logLE K.Info $ "Tensor: avg AAOV deviation=" <> show avgAAOVDeviationTensor
+
   K.logLE K.Info $ "doing weight vector optimization"
-  let owOptimizerData = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlpha)
-      owOptimize (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull nullVecs aV pV
-  aaOW' <- LA.fromColumns <$> traverse owOptimize owOptimizerData
-  let aaOW = pumaProductsTM + DTP.projToFullM nullVecs LA.<> aaOW'
-  let aaOWTD = zipWith totalDeviation (LA.toColumns pumasTM) (LA.toColumns aaOW)
-      avgAAOWDeviation = FL.fold FL.mean aaOWTD
-  K.logLE K.Info $ "avg AAOW deviation=" <> show avgAAOWDeviation
+  let owOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nV aV pV
+      owOptimizerData x = zip (LA.toColumns pumaProductsTM) (replicate nPUMA x)
+      toJoint nv alphas = pumaProductsTM + DTP.projToFullM nv LA.<> alphas
+  aaOWTensor <- LA.fromColumns <$> (traverse (owOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
+  aaOWSVD <- LA.fromColumns <$> (traverse (owOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD)
+  K.logLE K.Info $ "avg Tensor AAOW deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaOWTensor)
+  K.logLE K.Info $ "avg SVD AAOW deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaOWSVD)
 
-
+  K.logLE K.Info $ "doing weight vector optimization, invWeight"
+  let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nV aV pV
+      tryF t f = do
+        aaIWTensor <- LA.fromColumns <$> (traverse (iwOptimize f nullVecsTensor) $ owOptimizerData meanAlphaTensor)
+        aaIWSVD <- LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) $ owOptimizerData meanAlphaSVD)
+        K.logLE K.Info $ "avg Tensor AAIW deviation (f is " <> t <> ")=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaIWTensor)
+        K.logLE K.Info $ "avg SVD AAIW deviation (f is" <> t <> ")=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaIWSVD)
+--  tryF "-log x" (negate . Numeric.log)
+--  tryF "1/x" (\x -> 1/x)
+--  tryF "x^(-0.75)" (\x -> x ** (-0.75))
+--  tryF "1/sqrt(x)" (\x -> 1/sqrt x)
+--  tryF "x^(-0.25)" (\x -> x ** (-0.25))
+  K.logLE K.Info $ "Weight vector optimization via NNLS"
+  let asOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeightsAS DTP.defaultActiveSetConfig Nothing nV aV pV
+--  aaASTensor <- LA.fromColumns <$> (traverse (asOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
+  aaASSVD <- LA.fromColumns <$> (traverse (asOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD)
+--  K.logLE K.Info $ "avg Tensor AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaASTensor)
+  K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
 --      totalDev
   pure ()
 --      allPUMAMat = FL.fold pumasToMatFld testPUMAs
@@ -976,7 +1087,7 @@ asAE_average_stuff = do
 
 compareAS_AE :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareAS_AE cmdLine postInfo = do
-    K.logLE K.Info "Building test CD-level products for AS x AE -> ASE"
+    K.logLE K.Info "Building test PUMA-level products for AS x AE -> ASE"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
         (srcWindow, cachedSrc) = ACS.acs1Yr2010_20 @r
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
@@ -984,14 +1095,14 @@ compareAS_AE cmdLine postInfo = do
     let testPUMAs_C = byPUMA_C
     testPUMAs <- K.ignoreCacheTime testPUMAs_C
 
-    let optimalOnSimplex = DTP.viaOptimalWeights DTP.euclideanFull
+    let optimalOnSimplex = DTP.viaNearestOnSimplex --DTP.viaOptimalWeights DTP.euclideanFull
     (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
                                        $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.pUMA)) byPUMA_C
     pumaSVD_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASE @'[DT.SexC] @'[DT.Education4C]
                   optimalOnSimplex
-                  (Right "AS_AE_svd")
-                  (Right "model/demographic/AS_AE_svd")
-                  (DTM3.Model . tsModelConfig "AS_AE_svd")
+                  (Left "AS_AE_svd")
+                  (Left "model/demographic/AS_AE_svd")
+                  (const DTM3.Mean) --(DTM3.Model . tsModelConfig "AS_AE_svd")
                   (show . view GT.pUMA) cmdLine Nothing Nothing Nothing pumaTraining_C pumaTesting_C
 
     (pumaProductSVD, pumaSVD) <- K.ignoreCacheTime pumaSVD_C
@@ -1003,10 +1114,10 @@ compareAS_AE cmdLine postInfo = do
         catAndKnownsAll :: DNS.CatsAndKnowns (F.Record DMC.ASE) = DNS.CatsAndKnowns catMap
                                                                   [DNS.KnownMarginal "AS", DNS.KnownMarginal "AE"]
     pumaTensor_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASE @'[DT.SexC] @'[DT.Education4C]
-                     DTP.viaNearestOnSimplex
+                     optimalOnSimplex
                      (Left  "AS_AE_tensor")
                      (Left  "model/demographic/AS_AE_tensor")
-                     (DTM3.Model . tsModelConfig "AS_AE_tensor")
+                     (const DTM3.Mean) --(DTM3.Model . tsModelConfig "AS_AE_tensor")
                      (show . view GT.pUMA) cmdLine Nothing (Just ("Tensor", catAndKnownsAll)) Nothing pumaTraining_C pumaTesting_C
     (pumaProductTensor, pumaTensor) <- K.ignoreCacheTime pumaTensor_C
 
@@ -1016,7 +1127,7 @@ compareAS_AE cmdLine postInfo = do
         testPUMASet = FL.fold (FL.premap pumaKey FL.set) pumaTesting
         filterToTestPUMAs = F.filterFrame ((`S.member` testPUMASet) . pumaKey)
         pumaPopMap = FL.fold (FL.premap (\r -> (pumaKey r, r ^. DT.popCount)) $ FL.foldByKeyMap FL.sum) testPUMAs
-    pumaModelPaths <- postPaths "Model_AS_AS_ByPUMA" cmdLine
+    pumaModelPaths <- postPaths "Model_AS_AE_ByPUMA" cmdLine
     BRK.brNewPost pumaModelPaths postInfo "Model_AS_AS_ByPUMA" $ do
       compareResults @(DMC.PUMAOuterKeyR V.++ DMC.ASE)
         pumaModelPaths postInfo False False "AS_AE" ("PUMA", pumaPopMap, pumaKey) Nothing --(Just "NY")
@@ -1036,6 +1147,133 @@ compareAS_AE cmdLine postInfo = do
         ,MethodResult (fmap F.rcast pumaTensor) (Just "Tensor") (Just "Tensor") (Just "Tensor")
         ]
 
+
+compareAS_AR :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
+compareAS_AR cmdLine postInfo = do
+    K.logLE K.Info "Building test PUMA-level products for AS x AR -> ASR"
+    let filterToState sa r = r ^. GT.stateAbbreviation == sa
+        (srcWindow, cachedSrc) = ACS.acs1Yr2010_20 @r
+    byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASR . fmap F.rcast)
+                <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
+    let testPUMAs_C = byPUMA_C
+    testPUMAs <- K.ignoreCacheTime testPUMAs_C
+
+    let optimalOnSimplex = DTP.viaOptimalWeights DTP.euclideanFull 1e-4
+    (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
+                                       $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.pUMA)) byPUMA_C
+    pumaSVD_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASR @'[DT.SexC] @'[DT.Race5C]
+                  optimalOnSimplex
+                  (Left "AS_AR_svd")
+                  (Left "model/demographic/AS_AR_svd")
+                  (DTM3.Model . tsModelConfig "AS_AR_svd")
+                  (show . view GT.pUMA) cmdLine Nothing Nothing Nothing pumaTraining_C pumaTesting_C
+
+    (pumaProductSVD, pumaSVD) <- K.ignoreCacheTime pumaSVD_C
+
+    let catMap :: DNS.CatMap (F.Record DMC.ASR) = DNS.mkCatMap [('A', S.size $ Keyed.elements @DT.Age5)
+                                                            , ('S', S.size $ Keyed.elements @DT.Sex)
+                                                            , ('R', S.size $ Keyed.elements @DT.Race5)
+                                                            ]
+        catAndKnownsAll :: DNS.CatsAndKnowns (F.Record DMC.ASR) = DNS.CatsAndKnowns catMap
+                                                                  [DNS.KnownMarginal "AS", DNS.KnownMarginal "AR"]
+    pumaTensor_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASR @'[DT.SexC] @'[DT.Race5C]
+                     (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
+                     (Left  "AS_AR_tensor")
+                     (Left  "model/demographic/AS_AR_tensor")
+                     (const DTM3.Mean) --(DTM3.Model . tsModelConfig "AS_AE_tensor")
+                     (show . view GT.pUMA) cmdLine Nothing (Just ("Tensor", catAndKnownsAll)) Nothing pumaTraining_C pumaTesting_C
+    (pumaProductTensor, pumaTensor) <- K.ignoreCacheTime pumaTensor_C
+
+    pumaTesting <- K.ignoreCacheTime pumaTesting_C
+    let showCellKey r =  show (r ^. GT.stateAbbreviation, r ^. DT.age5C, r ^. DT.sexC, r ^. DT.race5C)
+        pumaKey r = (r ^. GT.stateAbbreviation, r ^. GT.pUMA)
+        testPUMASet = FL.fold (FL.premap pumaKey FL.set) pumaTesting
+        filterToTestPUMAs = F.filterFrame ((`S.member` testPUMASet) . pumaKey)
+        pumaPopMap = FL.fold (FL.premap (\r -> (pumaKey r, r ^. DT.popCount)) $ FL.foldByKeyMap FL.sum) testPUMAs
+    pumaModelPaths <- postPaths "Model_AS_AR_ByPUMA" cmdLine
+    BRK.brNewPost pumaModelPaths postInfo "Model_AS_AR_ByPUMA" $ do
+      compareResults @(DMC.PUMAOuterKeyR V.++ DMC.ASR)
+        pumaModelPaths postInfo False False "AS_AR" ("PUMA", pumaPopMap, pumaKey) Nothing --(Just "NY")
+        (F.rcast @DMC.ASR)
+        (\r -> (r ^. DT.sexC, r ^. DT.race5C))
+        (\r -> (r ^. DT.race5C, r ^. DT.age5C))
+        showCellKey
+        Nothing --(Just ("Race", show . view DT.race5C, Just raceOrder))
+        Nothing --(Just ("Age", show . view DT.age5C, Just ageOrder))
+        (ErrorFunction "L1 Error" l1Err pctFmt (* 100))
+        (ErrorFunction "Standardized Mean" stdMeanErr pctFmt id)
+        (fmap F.rcast $ testRowsWithZeros @DMC.PUMAOuterKeyR @DMC.ASR pumaTesting)
+        [MethodResult (fmap F.rcast $ testRowsWithZeros @DMC.PUMAOuterKeyR @DMC.ASR pumaTesting) (Just "Actual") Nothing Nothing
+        ,MethodResult (filterToTestPUMAs $ fmap F.rcast pumaProductSVD) (Just "Product (SVD)") (Just "Product (SVD)") (Just "Product (SVD)")
+        ,MethodResult (filterToTestPUMAs $ fmap F.rcast pumaProductTensor) (Just "Product (Tensor)") (Just "Product (Tensor)") (Just "Product (Tensor)")
+        ,MethodResult (fmap F.rcast pumaSVD) (Just "SVD") (Just "SVD") (Just "SVD")
+        ,MethodResult (fmap F.rcast pumaTensor) (Just "Tensor") (Just "Tensor") (Just "Tensor")
+        ]
+
+
+compareASR_ASE' :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
+compareASR_ASE' cmdLine postInfo = do
+    K.logLE K.Info "Building test PUMA-level products for ASR x ASE -> ASER"
+    let filterToState sa r = r ^. GT.stateAbbreviation == sa
+        (srcWindow, cachedSrc) = ACS.acs1Yr2010_20 @r
+    byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASER . fmap F.rcast)
+                <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
+    let testPUMAs_C = byPUMA_C
+    testPUMAs <- K.ignoreCacheTime testPUMAs_C
+
+    let optimalOnSimplex = DTP.viaNearestOnSimplex --DTP.viaOptimalWeights DTP.euclideanFull
+    (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
+                                       $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.pUMA)) byPUMA_C
+    pumaSVD_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
+                  optimalOnSimplex
+                  (Left "ASR_ASE_svd")
+                  (Left "model/demographic/ASR_ASE_svd")
+                  (const DTM3.Mean) -- (DTM3.Model . tsModelConfig "ASR_ASE_svd")
+                  (show . view GT.pUMA) cmdLine Nothing Nothing Nothing pumaTraining_C pumaTesting_C
+
+    (pumaProductSVD, pumaSVD) <- K.ignoreCacheTime pumaSVD_C
+
+    let catMap :: DNS.CatMap (F.Record DMC.ASER) = DNS.mkCatMap [('A', S.size $ Keyed.elements @DT.Age5)
+                                                                , ('S', S.size $ Keyed.elements @DT.Sex)
+                                                                , ('E', S.size $ Keyed.elements @DT.Education4)
+                                                                , ('R', S.size $ Keyed.elements @DT.Race5)
+                                                                ]
+        catAndKnownsAll :: DNS.CatsAndKnowns (F.Record DMC.ASER) = DNS.CatsAndKnowns catMap
+                                                                  [DNS.KnownMarginal "ASE", DNS.KnownMarginal "ASR"]
+    pumaTensor_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
+                     DTP.viaNearestOnSimplex
+                     (Left  "ASR_ASE_tensor")
+                     (Left  "model/demographic/ASR_ASE_tensor")
+                     (const DTM3.Mean) --(DTM3.Model . tsModelConfig "ASR_ASE_tensor")
+                     (show . view GT.pUMA) cmdLine Nothing (Just ("Tensor", catAndKnownsAll)) Nothing pumaTraining_C pumaTesting_C
+    (pumaProductTensor, pumaTensor) <- K.ignoreCacheTime pumaTensor_C
+
+    pumaTesting <- K.ignoreCacheTime pumaTesting_C
+    let showCellKey r =  show (r ^. GT.stateAbbreviation, r ^. DT.age5C, r ^. DT.sexC, r ^. DT.education4C, r ^. DT.race5C)
+        pumaKey r = (r ^. GT.stateAbbreviation, r ^. GT.pUMA)
+        testPUMASet = FL.fold (FL.premap pumaKey FL.set) pumaTesting
+        filterToTestPUMAs = F.filterFrame ((`S.member` testPUMASet) . pumaKey)
+        pumaPopMap = FL.fold (FL.premap (\r -> (pumaKey r, r ^. DT.popCount)) $ FL.foldByKeyMap FL.sum) testPUMAs
+    pumaModelPaths <- postPaths "Model_ASR_ASE_ByPUMA" cmdLine
+    BRK.brNewPost pumaModelPaths postInfo "Model_ASR_ASE_ByPUMA" $ do
+      compareResults @(DMC.PUMAOuterKeyR V.++ DMC.ASER)
+        pumaModelPaths postInfo False False "ASR_ASE" ("PUMA", pumaPopMap, pumaKey) Nothing --(Just "NY")
+        (F.rcast @DMC.ASER)
+        (\r -> (r ^. DT.sexC, r ^. DT.race5C))
+        (\r -> (r ^. DT.education4C, r ^. DT.age5C))
+        showCellKey
+        Nothing --(Just ("Race", show . view DT.race5C, Just raceOrder))
+        Nothing --(Just ("Age", show . view DT.age5C, Just ageOrder))
+        (ErrorFunction "L1 Error" l1Err pctFmt (* 100))
+        (ErrorFunction "Standardized Mean" stdMeanErr pctFmt id)
+        (fmap F.rcast $ testRowsWithZeros @DMC.PUMAOuterKeyR @DMC.ASER pumaTesting)
+        [MethodResult (fmap F.rcast $ testRowsWithZeros @DMC.PUMAOuterKeyR @DMC.ASER pumaTesting) (Just "Actual") Nothing Nothing
+        ,MethodResult (filterToTestPUMAs $ fmap F.rcast pumaProductSVD) (Just "Product (SVD)") (Just "Product (SVD)") (Just "Product (SVD)")
+        ,MethodResult (filterToTestPUMAs $ fmap F.rcast pumaProductTensor) (Just "Product (Tensor)") (Just "Product (Tensor)") (Just "Product (Tensor)")
+        ,MethodResult (fmap F.rcast pumaSVD) (Just "SVD") (Just "SVD") (Just "SVD")
+        ,MethodResult (fmap F.rcast pumaTensor) (Just "Tensor") (Just "Tensor") (Just "Tensor")
+        ]
+
 compareASR_ASE :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => BR.CommandLine -> BR.PostInfo -> K.Sem r ()
 compareASR_ASE cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for ASR x ASE -> ASER"
@@ -1046,11 +1284,11 @@ compareASR_ASE cmdLine postInfo = do
     let testPUMAs_C = byPUMA_C
     testPUMAs <- K.ignoreCacheTime testPUMAs_C
 
-    testCDs_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByCDGeoR @DMC.ASER . fmap F.rcast)
-                 <$> DDP.cachedACSa5ByCD srcWindow cachedSrc 2020 Nothing
-    testCDs <- K.ignoreCacheTime testCDs_C
+--    testCDs_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByCDGeoR @DMC.ASER . fmap F.rcast)
+--                 <$> DDP.cachedACSa5ByCD srcWindow cachedSrc 2020 Nothing
+--    testCDs <- K.ignoreCacheTime testCDs_C
 
-    let optimalOnSimplex = DTP.viaOptimalWeights DTP.euclideanFull
+    let optimalOnSimplex = DTP.viaOptimalWeights DTP.euclideanFull 1e-4
 --    let optimalOnSimplex = DTP.viaNearestOnSimplex
 --    let optimalOnSimplex = DTP.viaNearestOnSimplexPlus
 
@@ -1160,10 +1398,7 @@ compareASR_ASE cmdLine postInfo = do
     (_, pumaModeledAvgER_SER_AER_ASER) <- K.ignoreCacheTime pumaTestAvgER_SER_AER_ASER_C
 -}
 
-    let subsetER :: DT.Education4 -> DT.Race5 -> Set (F.Record [DT.Age5C, DT.SexC, DT.Education4C, DT.Race5C])
-        subsetER e r = S.fromList $ [a F.&: s F.&: e F.&: r F.&: V.RNil | a <- S.toList Keyed.elements, s <- S.toList Keyed.elements]
-        subsetsER = [subsetER e r | e <- S.toList Keyed.elements, r <- S.toList Keyed.elements]
-        catMap :: DNS.CatMap (F.Record DMC.ASER) = DNS.mkCatMap [('A', S.size $ Keyed.elements @DT.Age5)
+    let catMap :: DNS.CatMap (F.Record DMC.ASER) = DNS.mkCatMap [('A', S.size $ Keyed.elements @DT.Age5)
                                                                 , ('S', S.size $ Keyed.elements @DT.Sex)
                                                                 , ('E', S.size $ Keyed.elements @DT.Education4)
                                                                 , ('R', S.size $ Keyed.elements @DT.Race5)
@@ -1175,8 +1410,8 @@ compareASR_ASE cmdLine postInfo = do
     pumaTestNewBasis_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
   --                         (DTP.viaOptimalWeights DTP.euclideanFull)
                            DTP.viaNearestOnSimplex
-                           (Right  "ASR_ASE_NewBasis_ByPUMA")
-                           (Right  "model/demographic/asr_ase_NewBasis")
+                           (Left  "ASR_ASE_NewBasis_ByPUMA")
+                           (Left  "model/demographic/asr_ase_NewBasis")
                            (DTM3.Model . tsModelConfig "ASR_ASE_NewBasis_TestHalfPUMA")
                            (show . view GT.pUMA) cmdLine Nothing (Just ("NewBasis", catAndKnownsAll)) Nothing pumaTraining_C pumaTesting_C
     (_, pumaSplitNewBasis) <- K.ignoreCacheTime pumaTestNewBasis_C
@@ -1184,8 +1419,8 @@ compareASR_ASE cmdLine postInfo = do
     pumaTestOnlyER_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASER @'[DT.Race5C] @'[DT.Education4C]
 --                         (DTP.viaOptimalWeights DTP.euclideanFull)
                          DTP.viaNearestOnSimplex
-                         (Right  "ASR_ASE_NewBasis_PlusER_ByPUMA")
-                         (Right  "model/demographic/asr_ase_NewBasis_PlusER")
+                         (Left  "ASR_ASE_NewBasis_PlusER_ByPUMA")
+                         (Left  "model/demographic/asr_ase_NewBasis_PlusER")
                          (DTM3.Model . tsModelConfig "ASR_ASE_NewBasis_PlusER_TestHalfPUMA")
                          (show . view GT.pUMA) cmdLine Nothing (Just ("NewBasis_OnlyER", catAndKnownsOnlyER)) Nothing pumaTraining_C pumaTesting_C
     (_, pumaSplitOnlyER) <- K.ignoreCacheTime pumaTestOnlyER_C
@@ -1195,7 +1430,7 @@ compareASR_ASE cmdLine postInfo = do
         pumaKey ok = (ok ^. GT.stateAbbreviation, ok ^. GT.pUMA)
 
         pumaPopMap = FL.fold (FL.premap (\r -> (pumaKey r, r ^. DT.popCount)) $ FL.foldByKeyMap FL.sum) testPUMAs
-        cdPopMap = FL.fold (FL.premap (\r -> (DDP.districtKeyT r, r ^. DT.popCount)) $ FL.foldByKeyMap FL.sum) testCDs
+--        cdPopMap = FL.fold (FL.premap (\r -> (DDP.districtKeyT r, r ^. DT.popCount)) $ FL.foldByKeyMap FL.sum) testCDs
         showCellKey r =  show (r ^. GT.stateAbbreviation, r ^. DT.age5C, r ^. DT.sexC, r ^. DT.education4C, r ^. DT.race5C)
     pumaTesting <- K.ignoreCacheTime pumaTesting_C
     let pumaKey r = (r ^. GT.stateAbbreviation, r ^. GT.pUMA)
@@ -1315,7 +1550,7 @@ compareCASR_ASE cmdLine postInfo = do
     byPUMA <- K.ignoreCacheTime byPUMA_C
     (product_CASR_ASE, modeled_CASR_ASE) <- K.ignoreCacheTimeM
                                           $ testNS @DMC.PUMAOuterKeyR @DMC.CASER @'[DT.CitizenC, DT.Race5C] @'[DT.Education4C]
-                                          (DTP.viaOptimalWeights DTP.euclideanFull)
+                                          (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
                                           (Right "CASR_ASE_ByPUMA")
                                           (Right "model/demographic/casr_ase")
                                           (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
@@ -1422,6 +1657,7 @@ main = do
         (K.defaultKnitConfig $ Just cacheDir)
           { K.outerLogPrefix = Just "2022-Demographics"
           , K.logIf = BR.knitLogSeverity $ BR.logLevel cmdLine -- K.logDiagnostic
+--          , K.lcSeverity = M.fromList [("AlphaMismatch", K.Special)]
           , K.pandocWriterConfig = pandocWriterConfig
           , K.serializeDict = BRCC.flatSerializeDict
           , K.persistCache = KC.persistStrictByteString (\t → toString (cacheDir <> "/" <> t))
@@ -1444,9 +1680,11 @@ main = do
     DMC.checkCensusTables filteredCensusTables_C
 -}
 --    compareCSR_ASR cmdLine postInfo
---    asrASE_average_stuff
     asAE_average_stuff
 --    DED.mapPE $ compareAS_AE cmdLine postInfo
+--    DED.mapPE $ compareAS_AR cmdLine postInfo
+--    asrASE_average_stuff
+--    DED.mapPE $ compareASR_ASE' cmdLine postInfo
 --    DED.mapPE $ compareASR_ASE cmdLine postInfo
 {-    let amS = DED.averagingMatrix @(F.Record DMC.ASE) @(F.Record '[DT.Age5C, DT.Education4C]) F.rcast
         amE = DED.averagingMatrix @(F.Record DMC.ASE) @(F.Record DMC.AS) F.rcast
@@ -1720,7 +1958,7 @@ originalPost cmdLine postInfo = do
         K.logLE K.Info $ keyT <> " modeled  =" <> DED.prettyVector nvpsModeled
         let simplexFull = DTP.projectToSimplex $ DTP.applyNSPWeights nvps_SER_A5SR nvpsModeled (VS.map (/ VS.sum pV) pV)
             simplexNVPs = DTP.fullToProj nvps_SER_A5SR simplexFull
---        nvpsOptimal <- DED.mapPE $ DTP.optimalWeights testProjections nvpsModeled (VS.map (/ n) pV)
+--        nvpsOptimal <- DED.mapPE $ DTP.optimalWeights testProjections 1e-4 nvpsModeled (VS.map (/ n) pV)
         K.logLE K.Info $ keyT <> " onSimplex=" <> DED.prettyVector simplexNVPs
         K.logLE K.Info $ keyT <> " modeled counts=" <> DED.prettyVector (VS.map (* VS.sum pV) simplexFull)
 --    K.knitError "STOP"
@@ -1730,7 +1968,7 @@ originalPost cmdLine postInfo = do
           nvpsModeled <-  VS.fromList <$> (K.knitEither $ DTM1.modelResultNVPs DTM1.aserModelFuncs modelRes (view GT.stateAbbreviation ok) md)
           let simplexFull = VS.map (* n) $ DTP.projectToSimplex $ DTP.applyNSPWeights nvps_SER_A5SR nvpsModeled (VS.map (/ n) pV)
 --            simplexNVPs = DTP.fullToProj testProjections simplexFull
---          nvpsOptimal <- DED.mapPE $ DTP.optimalWeights testProjections nvpsModeled (VS.map (/ n) pV)
+--          nvpsOptimal <- DED.mapPE $ DTP.optimalWeights testProjections 1e-4 nvpsModeled (VS.map (/ n) pV)
           let mV = simplexFull --DTP.applyNSPWeights testProjections (VS.map (* n) nvpsOptimal) pV
           pure (ok, pV, mV)
     prodAndModeled1 <- traverse smcRowToProdAndModeled1 cdModelData1

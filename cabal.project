@@ -1,4 +1,4 @@
-packages: ./ ../../libs/model-demographic
+packages: ./ ../../libs/model-demographic ~/DataScience/data-science-utils
 jobs: 4
 with-compiler: ghc
 
@@ -29,6 +29,7 @@ import: ../../libs/cabal_repo_imports/Frames-streamly.project
 import: ../../libs/cabal_repo_imports/Frames-serialize.project
 import: ../../libs/cabal_repo_imports/Frames-utils.project
 import: ../../libs/cabal_repo_imports/Frames-hvega.project
+--import: ../../libs/cabal_repo_imports/data-science-utils.project
 import: ../../libs/cabal_repo_imports/hvega-utils.project
 import: ../../libs/cabal_repo_imports/map-reduce-folds.project
 import: ../../libs/cabal_repo_imports/heidi.project
