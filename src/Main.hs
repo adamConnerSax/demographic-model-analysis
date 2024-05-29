@@ -774,6 +774,12 @@ labeledToProdMatFld wl ms ok ik f = fmap (LA.fromColumns . filter vecNotNaN)
 totalDeviation :: LA.Vector Double -> LA.Vector Double -> Double
 totalDeviation v1 v2 = (VS.sum $ VS.map abs $ VS.zipWith (-) v1 v2) / 2
 
+bias :: LA.Matrix Double -> LA.Matrix Double -> LA.Vector Double
+bias x p = VS.fromList $ fmap (FL.fold FL.mean . VS.toList) $ LA.toRows $ x - p
+
+avgAbsBias :: LA.Matrix Double -> LA.Matrix Double -> Double
+avgAbsBias x p = FL.fold FL.mean $ VS.toList $ VS.map abs $ bias x p
+
 addToAll :: Double -> LA.Vector Double -> LA.Vector Double
 addToAll x = VS.map (+ x)
 
@@ -1022,19 +1028,25 @@ asAE_Tracts_Avg = do
   K.logLE K.Info $ "testing: N_tracts=" <> show nTracts
 
   logTime "" $ K.logLE K.Info $ "product <deviation>=" <> show (avgDeviation testProductsM)
+  logTime "" $ K.logLE K.Info $ "product <|bias|>=" <> show (avgAbsBias testM testProductsM)
   let toJoint nv alphas = testProductsM + DTP.projToFullM nv LA.<> alphas
       diffs = trainingM - trainingProductsM
       alphasSVD = DTP.fullToProjM nullVecsSVD LA.<> diffs
       (meanAlphaSVD, covAlphaSVD) = LA.meanCov $ LA.tr alphasSVD
-  let --prodAvgAlpha = testProductsM + LA.fromColumns (replicate nTracts $ DTP.projToFullM nullVecsSVD LA.#> meanAlphaSVD)
-      prodAvgAlpha = toJoint nullVecsSVD (LA.fromColumns$ replicate nTracts meanAlphaSVD )
+  let prodAvgAlpha = toJoint nullVecsSVD (LA.fromColumns$ replicate nTracts meanAlphaSVD )
   logTime "" $ K.logLE K.Info $ "AA <deviation>=" <> show (avgDeviation prodAvgAlpha)
   K.logLE K.Info $ "doing weight vector optimization"
   let owOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nV aV pV
       owOptimizerData x = zip (LA.toColumns testProductsM) (replicate nTracts x)
-
   aaOWSVD <- logTime "Weights (SVD)" (LA.fromColumns <$> (traverse (owOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD))
-  K.logLE K.Info $ "avg SVD AAOW deviation=" <> show (avgDeviation $ toJoint nullVecsSVD aaOWSVD)
+  K.logLE K.Info $ "AAOW <deviation>=" <> show (avgDeviation $ toJoint nullVecsSVD aaOWSVD)
+  K.logLE K.Info $ "AAOW <|bias|>=" <> show (avgAbsBias (toJoint nullVecsSVD aaOWSVD) testM)
+  {-
+  trainingTracts <- K.ignoreCacheTime training_C
+  tractASEToCSV "Tracts_ASE_Training.csv" $ fmap F.rcast trainingTracts
+  testTracts <- K.ignoreCacheTime testing_C
+  tractASEToCSV "Tracts_ASE_Testing.csv" $ fmap F.rcast testTracts
+-}
   pure ()
 
 
@@ -1887,9 +1899,9 @@ splitGEOs split outer inner rows = do
   f $ FL.fold FL.list rows
 
 
-type ToCsvR = [GT.StateAbbreviation, GT.PUMA, DT.Age5C, DT.SexC, DT.Education4C, DT.Race5C, DT.PopCount]
+type PUMA_ASERToCsvR = [GT.StateAbbreviation, GT.PUMA, DT.Age5C, DT.SexC, DT.Education4C, DT.Race5C, DT.PopCount]
 
-pumaASERToCSV :: K.KnitEffects r => Text -> F.FrameRec ToCsvR -> K.Sem r ()
+pumaASERToCSV :: K.KnitEffects r => Text -> F.FrameRec PUMA_ASERToCsvR -> K.Sem r ()
 pumaASERToCSV fileName rows = do
   let newHeaderMap = M.fromList [("StateAbbreviation", "state")
                                 ,("PUMA","puma")
@@ -1899,13 +1911,34 @@ pumaASERToCSV fileName rows = do
                                 , ("Education4C", "education_4")
                                 , ("Race5C", "race_5")
                                 ]
-      formatRows :: V.Rec (V.Lift (->) V.ElField (V.Const Text)) ToCsvR
+      formatRows :: V.Rec (V.Lift (->) V.ElField (V.Const Text)) PUMA_ASERToCsvR
       formatRows = FCSV.formatTextAsIs V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow
                    V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& V.RNil
   K.liftKnit @IO $ FCSV.writeLines ("../../forPhilip/" <> toString fileName)
     $ FCSV.streamSV' @_ @(StreamlyStream Stream) newHeaderMap formatRows ","
     $ FCSV.foldableToStream
     $ fmap F.rcast rows
+
+type TractASEToCsvR = [GT.StateAbbreviation, GT.TractId, DT.Age5C, DT.SexC, DT.Education4C, DT.PopCount]
+
+
+tractASEToCSV :: K.KnitEffects r => Text -> F.FrameRec TractASEToCsvR -> K.Sem r ()
+tractASEToCSV fileName rows = do
+  let newHeaderMap = M.fromList [("StateAbbreviation", "state")
+                                ,("TractId","tractId")
+                                , ("PopCount", "pop_count")
+                                , ("Age5C", "age_5")
+                                , ("SexC", "sex_2")
+                                , ("Education4C", "education_4")
+                                ]
+      formatRows :: V.Rec (V.Lift (->) V.ElField (V.Const Text)) TractASEToCsvR
+      formatRows = FCSV.formatTextAsIs V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow
+                   V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& V.RNil
+  K.liftKnit @IO $ FCSV.writeLines ("../../forMax/" <> toString fileName)
+    $ FCSV.streamSV' @_ @(StreamlyStream Stream) newHeaderMap formatRows ","
+    $ FCSV.foldableToStream
+    $ fmap F.rcast rows
+
 
 
 
