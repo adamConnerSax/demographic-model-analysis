@@ -44,6 +44,7 @@ executable demographic-model-analysis
    , flat >= 0.6 && < 0.7
    , foldl >= 1.4 && < 1.5
    , foldl-statistics >= 0.1.5 && < 0.2
+   , ghc-debug-stub >= 0.6.0.0
    , haskell-stan >= 0.1 && < 0.2
    , hs-cmdstan >= 0.1 && < 0.2
    , hmatrix >= 0.20 && < 0.21

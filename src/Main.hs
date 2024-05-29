@@ -30,6 +30,8 @@ import qualified BlueRipple.Model.Demographic.NullSpaceBasis as DNS
 import qualified BlueRipple.Data.Keyed as Keyed
 
 import qualified BlueRipple.Data.ACS_PUMS as ACS
+import qualified BlueRipple.Data.ACS_Tables as ACS
+import qualified BlueRipple.Data.ACS_Tables_Loaders as ACS
 import qualified BlueRipple.Data.Types.Demographic as DT
 import qualified BlueRipple.Data.Types.Geographic as GT
 import qualified BlueRipple.Data.Small.DataFrames as BRDF
@@ -90,6 +92,8 @@ import qualified Graphics.Vega.VegaLite.Configuration as FV
 import qualified Graphics.Vega.VegaLite.JSON as VJ
 
 import qualified System.Environment as Env
+
+import GHC.Debug.Stub (withGhcDebug)
 
 templateVars ∷ M.Map String String
 templateVars =
@@ -511,6 +515,7 @@ testRowsWithZeros :: forall outerK ks .
                      , F.ElemOf (ks V.++ [DT.PopCount, DT.PWPopPerSqMile]) DT.PopCount
                      , Ord (F.Record outerK)
                      , outerK F.⊆ TestRow outerK ks
+                     , FSI.RecVec (outerK V.++ (ks V.++ [DT.PopCount, DT.PWPopPerSqMile]))
                      )
                   => F.FrameRec (TestRow outerK ks)
                   -> F.FrameRec (TestRow outerK ks)
@@ -540,6 +545,7 @@ type AggregateAndZeroFillC ls ks =
   , F.ElemOf (ks V.++ [DT.PopCount, DT.PWPopPerSqMile]) DT.PWPopPerSqMile
   , Keyed.FiniteSet (F.Record ks)
   , Ord (F.Record ks)
+  , FSI.RecVec (ls V.++ (ks V.++ [DT.PopCount, DT.PWPopPerSqMile]))
   )
 aggregateAndZeroFillTables :: forall ls ks . AggregateAndZeroFillC ls ks
                            => F.FrameRec (ls V.++ ks V.++ [DT.PopCount, DT.PWPopPerSqMile])
@@ -735,9 +741,12 @@ aseASR_ASER_Products ck test_C = do
   DMC.tableProducts @[GT.StateAbbreviation, GT.PUMA] @DMC.AS @[DT.Race5C] @[DT.Education4C] ck testAs_C testBs_C
 -}
 -- outerKey cols in input order, innerKey rows in key order
+vecNotNaN :: VS.Vector Double -> Bool
+vecNotNaN = isNothing . VS.findIndex isNaN
+
 labeledToMatFld :: (Ord outerKey, Ord innerKey, Keyed.FiniteSet innerKey)
                  => (F.Record rs -> outerKey) -> (F.Record rs -> innerKey) -> (F.Record rs -> Double) -> FL.Fold (F.Record rs) (LA.Matrix Double)
-labeledToMatFld ok ik f = fmap LA.fromColumns
+labeledToMatFld ok ik f = fmap (LA.fromColumns . filter vecNotNaN)
                           $ MR.mapReduceFold
                           MR.noUnpack
                           (MR.assign ok (\x -> (ik x, f x)))
@@ -752,7 +761,7 @@ labeledToProdMatFld :: (Ord outerKey, Ord innerKey, Keyed.FiniteSet innerKey, Mo
                     => Lens' w Double
                     -> DMS.MarginalStructure w innerKey
                     -> (F.Record rs -> outerKey) -> (F.Record rs -> innerKey) -> (F.Record rs -> w) -> FL.Fold (F.Record rs) (LA.Matrix Double)
-labeledToProdMatFld wl ms ok ik f = fmap LA.fromColumns
+labeledToProdMatFld wl ms ok ik f = fmap (LA.fromColumns . filter vecNotNaN)
                                     $ MR.mapReduceFold
                                     MR.noUnpack
                                     (MR.assign ok (\x -> (ik x, f x)))
@@ -889,14 +898,26 @@ asrASE_average_stuff = do
 --      avgAAOSDeviation = FL.fold FL.mean aaOsTotalDeviations
   K.logLE K.Info $ "SVD: avg AAOS deviation=" <> show (avgDeviation aaOSSVD)
   K.logLE K.Info $ "Tensor: avg AAOS deviation=" <> show (avgDeviation aaOSTensor)
-  K.logLE K.Info $ "Weight vector optimization via Active Set"
+  K.logLE K.Info $ "Weight vector optimization via NNLS"
   let toJoint nv alphas = pumaProductsTM + DTP.projToFullM nv LA.<> alphas
       owOptimizerDataSVD = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlphaSVD)
-      asOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeightsAS (DTP.defaultActiveSetConfig { DTP.asSolver = DTP.SolveSVD }) Nothing nV aV pV
+      nnlsConfig = DTP.defaultActiveSetConfig { DTP.cfgLogging = DTP.LogOnError, DTP.cfgStart = DTP.StartGS, DTP.cfgSolver = DTP.SolveLS}
+      nnlsLSI_E nV = K.liftKnit @IO $ DTP.precomputeFromE nnlsConfig (DTP.projToFullM nV)
+      leftError me = do
+        e <- me
+        case e of
+          Left msg -> K.knitError msg
+          Right x -> pure x
+      asOptimize nV mLSI_E (pV, aV) = DED.mapPE $ DTP.optimalWeightsAS nnlsConfig Nothing mLSI_E nV aV pV
+      logTime = K.logTime (K.logLE K.Info)
 --  aaASTensor <- LA.fromColumns <$> (traverse (asOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
-  aaASSVD <- LA.fromColumns <$> (traverse (asOptimize nullVecsSVD) $ owOptimizerDataSVD)
---  K.logLE K.Info $ "avg Tensor AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaASTensor)
+  aaASSVD <- logTime "NNLS" (LA.fromColumns <$> (traverse (asOptimize nullVecsSVD Nothing) $ owOptimizerDataSVD))
   K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
+  aaASSVD <- logTime "NNLS (precompute)" (LA.fromColumns <$> (leftError (nnlsLSI_E nullVecsSVD) >>= \lsiE -> (traverse (asOptimize nullVecsSVD (Just lsiE)) $ owOptimizerDataSVD)))
+  K.logLE K.Info $ "avg SVD NNLS (precompute) deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
+
+
+--  K.logLE K.Info $ "avg Tensor AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaASTensor)
 
 {-  K.logLE K.Info $ "doing full vector optimization"
   let optimizerDataSVD = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSSVD)
@@ -910,17 +931,17 @@ asrASE_average_stuff = do
   K.logLE K.Info $ "doing weight vector optimization"
   let owOptimizerDataTensor = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlphaTensor)
       owOptimize nv (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nv aV pV
-{-  aaOWSVD' <- LA.fromColumns <$> traverse (owOptimize nullVecsSVD) owOptimizerDataSVD
-  aaOWTensor' <- LA.fromColumns <$> traverse (owOptimize nullVecsTensor) owOptimizerDataTensor
+  aaOWSVD' <- logTime "SLSQP" (LA.fromColumns <$> traverse (owOptimize nullVecsSVD) owOptimizerDataSVD)
+--  aaOWTensor' <- LA.fromColumns <$> traverse (owOptimize nullVecsTensor) owOptimizerDataTensor
   let aaOWSVD = pumaProductsTM + DTP.projToFullM nullVecsSVD LA.<> aaOWSVD'
-  let aaOWTensor = pumaProductsTM + DTP.projToFullM nullVecsTensor LA.<> aaOWTensor'
+--  let aaOWTensor = pumaProductsTM + DTP.projToFullM nullVecsTensor LA.<> aaOWTensor'
   K.logLE K.Info $ "SVD: avg AAOW deviation=" <> show (avgDeviation aaOWSVD)
-  K.logLE K.Info $ "Tensor: avg AAOW deviation=" <> show (avgDeviation aaOWTensor)
--}
+--  K.logLE K.Info $ "Tensor: avg AAOW deviation=" <> show (avgDeviation aaOWTensor)
+
   K.logLE K.Info $ "doing weight vector optimization, invWeight"
   let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nV aV pV
       tryF t f = do
-        aaIWSVD <- LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) owOptimizerDataSVD)
+        aaIWSVD <- logTime "weighted SLSQP" (LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) owOptimizerDataSVD))
         K.logLE K.Info $ "avg SVD AAIW deviation (f is " <> t <> ")=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaIWSVD)
 --  tryF "-log x" (negate . Numeric.log)
 --  tryF "1/x" (\x -> 1/x)
@@ -931,6 +952,90 @@ asrASE_average_stuff = do
 --      totalDev
   pure ()
 --      allPUMAMat = FL.fold pumasToMatFld testPUMAs
+
+type TractGeoR = [BRDF.Year, GT.StateAbbreviation, GT.TractId]
+type TractRow ks = ACS.CensusRow ACS.TractLocationR ACS.CensusDataR ks
+
+asAE_Tracts_Avg :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
+asAE_Tracts_Avg = do
+  let logTime = K.logTime (K.logLE K.Info)
+  tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
+  allTractsASE_C <- logTime "Aggregate..."
+                    $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
+                    $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.ASE . fmap F.rcast . ACS.ageSexEducation)
+  tractIds <-  logTime "Ids to list" (FL.fold (FL.premap (view GT.tractId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
+  let n = (FL.fold FL.length tractIds)
+  K.logLE K.Info $  "Loaded " <> show n <> " rows; " <> show (n `div` 40) <> " tracts."
+--  K.logLE K.Info $ "IDs: " <> show tractIds
+
+
+  (training_C, testing_C) <- logTime "Training/testing split"
+                             $ KC.wctSplit
+                             $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.tractId)) allTractsASE_C
+  testTracts <- K.ignoreCacheTime testing_C
+  let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
+  nullVecsSVD <- K.knitMaybe "asAE_Tracts_Avg: Problem constructing SVD nullVecs. Bad marginal subsets?"
+                 $  DTP.nullVecsMS ms Nothing
+
+  let covFld :: FL.Fold (F.Record (DMC.ASE V.++ '[DT.PopCount, DT.PWPopPerSqMile])) [Double]
+      covFld = fmap VS.toList $ DMC.innerFoldWD (F.rcast @DMC.AS) (F.rcast @DMC.AE)
+      popVecFld = DED.vecFld getSum (Sum . realToFrac . view DT.popCount) (F.rcast @DMC.ASE)
+      popFld = FL.premap (realToFrac . view DT.popCount) FL.sum
+      safeDiv x y = if y /= 0 then x / y else 0
+      alphaFld nv = (\p -> VS.toList . DTP.fullToProj nv . VS.map (flip safeDiv p)) <$> popFld <*> popVecFld
+      alphaCovInner nv k = (\as cs -> AlphaCov (k ^. GT.stateAbbreviation) (k ^. GT.tractId) as cs) <$> alphaFld nv <*> covFld
+      alphaCovFld :: DTP.NullVectorProjections (F.Record DMC.ASE) -> FL.Fold (F.Record (DMC.TractRowR DMC.ASE)) [AlphaCov]
+      alphaCovFld nv = MR.mapReduceFold
+                       MR.noUnpack
+                       (MR.assign (F.rcast @[GT.StateAbbreviation, GT.TractId]) (F.rcast @(DMC.ASE V.++ '[DT.PopCount, DT.PWPopPerSqMile])))
+                       (MR.ReduceFold $ alphaCovInner nv)
+      alphaCovs nv = FL.fold (alphaCovFld nv) testTracts
+      avgAlphaFld n = FL.premap (\ac -> acAlphas ac List.!! n) FL.mean
+      avgAlphasFld = fmap VS.fromList $ traverse avgAlphaFld [0..119]
+      avgAlphas nv = FL.fold avgAlphasFld $ alphaCovs nv
+      avgChange nv = zip (S.toList $ Keyed.elements @(F.Record DMC.ASE)) $ VS.toList $ DTP.projToFull nv (avgAlphas nv)
+      showKey k = T.intercalate ", " $ [show (k ^. DT.age5C), show (k ^. DT.sexC), show (k ^. DT.education4C)]
+
+  K.logLE K.Info $ "Computing total deviation of products..."
+  let tractsToMatFld :: FL.Fold (F.Record (DMC.TractRowR DMC.ASE)) (LA.Matrix Double)
+      tractsToMatFld = labeledToMatFld (F.rcast @[GT.StateAbbreviation, GT.TractId]) (F.rcast @DMC.ASE) (realToFrac . view DT.popCount)
+      tractsToProdMatFld :: FL.Fold (F.Record (DMC.TractRowR DMC.ASE)) (LA.Matrix Double)
+      tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @[GT.StateAbbreviation, GT.TractId]) (F.rcast @DMC.ASE) DTM3.cwdF
+  (testM, testProductsM) <- logTime "test -> matrices & product matrices"
+                            $ fmap (first matrix . second matrix)
+                            $ K.ignoreCacheTimeM
+                            $ BRCC.retrieveOrMakeD "test/AS_AE/tracts/matricesTesting.bin" testing_C $ \x -> do
+    let (pumas, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ fmap F.rcast x
+    pure $ (FlatMatrix pumas, FlatMatrix products)
+
+  (trainingM, trainingProductsM) <- logTime "training -> matrices & product matrices"
+                                    $ fmap (first matrix . second matrix)
+                                    $ K.ignoreCacheTimeM
+                                    $ BRCC.retrieveOrMakeD "test/AS_AE/tracts/matricesTraining.bin" training_C $ \x -> do
+    let (pumas, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ fmap F.rcast x
+    pure $ (FlatMatrix pumas, FlatMatrix products)
+
+  let totalDeviations x = zipWith totalDeviation (LA.toColumns testM) (LA.toColumns x)
+      avgDeviation x = FL.fold FL.mean $ totalDeviations x
+      avgDeviation' x = FL.fold FL.mean $ filter (not . isNaN) $ totalDeviations x
+      nTracts = LA.cols testM
+  K.logLE K.Info $ "testing: N_tracts=" <> show nTracts
+
+  logTime "" $ K.logLE K.Info $ "product <deviation>=" <> show (avgDeviation testProductsM)
+  let toJoint nv alphas = testProductsM + DTP.projToFullM nv LA.<> alphas
+      diffs = trainingM - trainingProductsM
+      alphasSVD = DTP.fullToProjM nullVecsSVD LA.<> diffs
+      (meanAlphaSVD, covAlphaSVD) = LA.meanCov $ LA.tr alphasSVD
+  let --prodAvgAlpha = testProductsM + LA.fromColumns (replicate nTracts $ DTP.projToFullM nullVecsSVD LA.#> meanAlphaSVD)
+      prodAvgAlpha = toJoint nullVecsSVD (LA.fromColumns$ replicate nTracts meanAlphaSVD )
+  logTime "" $ K.logLE K.Info $ "AA <deviation>=" <> show (avgDeviation prodAvgAlpha)
+  K.logLE K.Info $ "doing weight vector optimization"
+  let owOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nV aV pV
+      owOptimizerData x = zip (LA.toColumns testProductsM) (replicate nTracts x)
+
+  aaOWSVD <- logTime "Weights (SVD)" (LA.fromColumns <$> (traverse (owOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD))
+  K.logLE K.Info $ "avg SVD AAOW deviation=" <> show (avgDeviation $ toJoint nullVecsSVD aaOWSVD)
+  pure ()
 
 
 asAE_average_stuff :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
@@ -1045,11 +1150,12 @@ asAE_average_stuff = do
   K.logLE K.Info $ "doing full vector optimization"
   let optimize nv (p, t) = DED.mapPE $ DTP.optimalVector nv p t
       optimizerDataSVD = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSSVD)
-  aaOVSVD <- LA.fromColumns <$> traverse (optimize nullVecsSVD) optimizerDataSVD
+      logTime = K.logTime (K.logLE K.Info)
+  aaOVSVD <- logTime "Full Vector (SVD)" (LA.fromColumns <$> traverse (optimize nullVecsSVD) optimizerDataSVD)
   let avgAAOVDeviationSVD = FL.fold FL.mean $ totalDeviations aaOVSVD
   K.logLE K.Info $ "SVD: avg AAOV deviation=" <> show avgAAOVDeviationSVD
   let optimizerDataTensor = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSTensor)
-  aaOVTensor <- LA.fromColumns <$> traverse (optimize nullVecsTensor) optimizerDataTensor
+  aaOVTensor <- logTime "Full Vector (SVD)" (LA.fromColumns <$> traverse (optimize nullVecsTensor) optimizerDataTensor)
   let avgAAOVDeviationTensor = FL.fold FL.mean $ totalDeviations aaOVTensor
   K.logLE K.Info $ "Tensor: avg AAOV deviation=" <> show avgAAOVDeviationTensor
 
@@ -1057,29 +1163,38 @@ asAE_average_stuff = do
   let owOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nV aV pV
       owOptimizerData x = zip (LA.toColumns pumaProductsTM) (replicate nPUMA x)
       toJoint nv alphas = pumaProductsTM + DTP.projToFullM nv LA.<> alphas
-  aaOWTensor <- LA.fromColumns <$> (traverse (owOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
-  aaOWSVD <- LA.fromColumns <$> (traverse (owOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD)
+  aaOWTensor <- logTime "Weights (Tensor)" (LA.fromColumns <$> (traverse (owOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor))
+  aaOWSVD <- logTime "Weights (SVD)" (LA.fromColumns <$> (traverse (owOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD))
   K.logLE K.Info $ "avg Tensor AAOW deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaOWTensor)
   K.logLE K.Info $ "avg SVD AAOW deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaOWSVD)
 
   K.logLE K.Info $ "doing weight vector optimization, invWeight"
   let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nV aV pV
       tryF t f = do
-        aaIWTensor <- LA.fromColumns <$> (traverse (iwOptimize f nullVecsTensor) $ owOptimizerData meanAlphaTensor)
-        aaIWSVD <- LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) $ owOptimizerData meanAlphaSVD)
+        aaIWTensor <- logTime "Weighted (Tensor)" (LA.fromColumns <$> (traverse (iwOptimize f nullVecsTensor) $ owOptimizerData meanAlphaTensor))
+        aaIWSVD <- logTime "Weighted (SVD)" (LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) $ owOptimizerData meanAlphaSVD))
         K.logLE K.Info $ "avg Tensor AAIW deviation (f is " <> t <> ")=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaIWTensor)
         K.logLE K.Info $ "avg SVD AAIW deviation (f is" <> t <> ")=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaIWSVD)
 --  tryF "-log x" (negate . Numeric.log)
 --  tryF "1/x" (\x -> 1/x)
 --  tryF "x^(-0.75)" (\x -> x ** (-0.75))
---  tryF "1/sqrt(x)" (\x -> 1/sqrt x)
+  tryF "1/sqrt(x)" (\x -> 1/sqrt x)
 --  tryF "x^(-0.25)" (\x -> x ** (-0.25))
   K.logLE K.Info $ "Weight vector optimization via NNLS"
-  let asOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeightsAS DTP.defaultActiveSetConfig Nothing nV aV pV
+  let nnlsConfig = DTP.defaultActiveSetConfig { DTP.cfgLogging = DTP.LogOnError, DTP.cfgStart = DTP.StartGS, DTP.cfgSolver = DTP.SolveLS }
+      nnlsLSI_E nV = K.liftKnit @IO $ DTP.precomputeFromE nnlsConfig (DTP.projToFullM nV)
+      leftError me = do
+        e <- me
+        case e of
+          Left msg -> K.knitError msg
+          Right x -> pure x
+      asOptimize nV  mLSI_E (pV, aV) = DED.mapPE $ DTP.optimalWeightsAS nnlsConfig (Just (\x -> 1 / sqrt x)) mLSI_E nV aV pV
 --  aaASTensor <- LA.fromColumns <$> (traverse (asOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
-  aaASSVD <- LA.fromColumns <$> (traverse (asOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD)
---  K.logLE K.Info $ "avg Tensor AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaASTensor)
+  aaASSVD <- logTime "NNLS (SVD), naive" (LA.fromColumns <$> (traverse (asOptimize nullVecsSVD Nothing) $ owOptimizerData meanAlphaSVD))
   K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
+  aaASSVD' <- logTime "NNLS (SVD), precompute" (LA.fromColumns <$> (leftError (nnlsLSI_E nullVecsSVD) >>= \lsiE -> (traverse (asOptimize nullVecsSVD (Just lsiE)) $ owOptimizerData meanAlphaSVD)))
+--  K.logLE K.Info $ "avg Tensor AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaASTensor)
+  K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD')
 --      totalDev
   pure ()
 --      allPUMAMat = FL.fold pumasToMatFld testPUMAs
@@ -1680,7 +1795,8 @@ main = do
     DMC.checkCensusTables filteredCensusTables_C
 -}
 --    compareCSR_ASR cmdLine postInfo
-    asAE_average_stuff
+    asAE_Tracts_Avg
+--    asAE_average_stuff
 --    DED.mapPE $ compareAS_AE cmdLine postInfo
 --    DED.mapPE $ compareAS_AR cmdLine postInfo
 --    asrASE_average_stuff
