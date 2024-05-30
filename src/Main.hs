@@ -774,11 +774,29 @@ labeledToProdMatFld wl ms ok ik f = fmap (LA.fromColumns . filter vecNotNaN)
 totalDeviation :: LA.Vector Double -> LA.Vector Double -> Double
 totalDeviation v1 v2 = (VS.sum $ VS.map abs $ VS.zipWith (-) v1 v2) / 2
 
+totalDeviationM :: LA.Matrix Double -> LA.Matrix Double -> LA.Vector Double
+totalDeviationM m1 m2 = VS.fromList $ fmap ((/ 2) . VS.sum . VS.map abs) $ LA.toColumns $ m1 - m2
+
+avgTotalDeviation :: LA.Matrix Double -> LA.Matrix Double -> Double
+avgTotalDeviation m1 m2 = FL.fold FL.mean $ VS.toList $ totalDeviationM m1 m2
+
 bias :: LA.Matrix Double -> LA.Matrix Double -> LA.Vector Double
-bias x p = VS.fromList $ fmap (FL.fold FL.mean . VS.toList) $ LA.toRows $ x - p
+bias x y = VS.fromList $ fmap (FL.fold FL.mean . VS.toList) $ LA.toRows $ x - y
 
 avgAbsBias :: LA.Matrix Double -> LA.Matrix Double -> Double
-avgAbsBias x p = FL.fold FL.mean $ VS.toList $ VS.map abs $ bias x p
+avgAbsBias x y = FL.fold FL.mean $ VS.toList $ VS.map abs $ bias x y
+
+rmse :: LA.Matrix Double -> LA.Matrix Double -> LA.Vector Double
+rmse x y = VS.fromList $ fmap (fmap sqrt (FL.fold (FL.premap (^2) FL.mean) . VS.toList)) $ LA.toRows $ x - y
+
+avgRMSE :: LA.Matrix Double -> LA.Matrix Double -> Double
+avgRMSE x y = FL.fold FL.mean $ VS.toList $ VS.map abs $ rmse x y
+
+reportErrors :: K.KnitEffects r => Text -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r ()
+reportErrors t m1 m2 = do
+  K.logLE K.Info $ t <> " <TotalDeviation> = " <> show (avgTotalDeviation m1 m2)
+  K.logLE K.Info $ t <> " <RMSE>           = " <> show (avgRMSE m1 m2)
+  K.logLE K.Info $ t <> " <|bias|>         = " <> show (avgAbsBias m1 m2)
 
 addToAll :: Double -> LA.Vector Double -> LA.Vector Double
 addToAll x = VS.map (+ x)
@@ -962,6 +980,85 @@ asrASE_average_stuff = do
 type TractGeoR = [BRDF.Year, GT.StateAbbreviation, GT.TractId]
 type TractRow ks = ACS.CensusRow ACS.TractLocationR ACS.CensusDataR ks
 
+
+buildCachedTestTrain :: forall ls ks rs a b r .
+                        (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
+                        , F.ElemOf rs DT.PopCount
+                        , F.ElemOf rs DT.PWPopPerSqMile
+                        , ks F.⊆ rs, ls F.⊆ rs
+                        , Ord (F.Record ls)
+                        , Ord (F.Record ks)
+                        , Keyed.FiniteSet (F.Record ks)
+                        , Eq a, Eq b
+                        , FSI.RecVec rs)
+                     => (F.Record rs -> a)
+                     -> (F.Record rs -> b)
+                     -> DMS.MarginalStructure DMS.CellWithDensity (F.Record ks)
+                     -> Text
+                     -> K.ActionWithCacheTime r (F.FrameRec rs)
+                     -> K.Sem r (LA.Matrix Double, LA.Matrix Double, LA.Matrix Double, LA.Matrix Double)
+buildCachedTestTrain splitRegion splitId ms cachePrefix rows_C = do
+  let logTime = K.logTime (K.logLE K.Info)
+  (training_C, testing_C) <- logTime "Training/testing split"
+                             $ KC.wctSplit
+                             $ KC.wctBind (splitGEOs testHalf splitRegion splitId) rows_C
+
+  let tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+      tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
+      tractsToProdMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+      tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @ls) (F.rcast @ks) DTM3.cwdF
+      matrices t dat_C = logTime (t <> " -> matrices & product matrices")
+                         $ fmap (first matrix . second matrix)
+                         $ K.ignoreCacheTimeM
+                         $ BRCC.retrieveOrMakeD (cachePrefix <> "matrices" <> t <> ".bin") dat_C $ \x -> do
+        let (pumas, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ x --fmap F.rcast x
+        pure $ (FlatMatrix pumas, FlatMatrix products)
+
+  (testM, testPM) <- matrices "Test" testing_C
+  (trainM, trainPM) <- matrices "Train" training_C
+  pure (testM, testPM, trainM, trainPM)
+
+-- covariates to alphas
+type AlphaModel r = LA.Vector Double -> K.Sem r (LA.Vector Double)
+
+averageAlphaModel :: LA.Matrix Double -> AlphaModel r
+averageAlphaModel rawAlphaM = const $ pure mean
+  where (mean, _) = LA.meanCov $ LA.tr rawAlphaM
+
+-- matrix of covariates to matrix of alphas
+applyAlphaModel :: AlphaModel r -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
+applyAlphaModel am = fmap LA.fromColumns . traverse am . LA.toColumns
+
+trueAlpha :: DTP.NullVectorProjections k -> LA.Matrix Double -> LA.Matrix Double -> LA.Matrix Double
+trueAlpha nv true prod = DTP.fullToProjM nv LA.<> diffs
+  where diffs = true - prod
+
+type OnSimplex r = LA.Vector Double -> LA.Vector Double -> K.Sem r (LA.Vector Double)
+
+applyOnSimplex :: OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
+applyOnSimplex os pM aM = fmap LA.fromColumns $ traverse (uncurry os) $ zip (LA.toColumns pM) (LA.toColumns aM)
+
+noOnSimplex :: OnSimplex r
+noOnSimplex _ aM = pure aM
+
+nearestOnSimplex :: DTP.NullVectorProjections k  -> OnSimplex r
+nearestOnSimplex nvps pM aM = pure $ DTP.fullToProj nvps $ DTP.projectToSimplex (pM + DTP.projToFull nvps aM)
+
+euclideanSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex r
+euclideanSLSQP nvps pM aM = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nvps aM pM
+
+weightedSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> (Double -> Double) -> OnSimplex r
+weightedSLSQP nvps f pM aM = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nvps aM pM
+
+modelAndSimplex :: AlphaModel r -> OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
+modelAndSimplex am os covM pM = applyAlphaModel am covM >>= \aM -> applyOnSimplex os pM aM
+
+estimates :: DTP.NullVectorProjections k -> LA.Matrix Double -> LA.Matrix Double -> LA.Matrix Double
+estimates nvps pM aM = pM + DTP.projToFullM nvps LA.<> aM
+
+estimate :: DTP.NullVectorProjections k -> AlphaModel r -> OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
+estimate nvps am os covM pM = fmap (estimates nvps pM) $ modelAndSimplex am os covM pM
+
 asAE_Tracts_Avg :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
 asAE_Tracts_Avg = do
   let logTime = K.logTime (K.logLE K.Info)
@@ -970,78 +1067,33 @@ asAE_Tracts_Avg = do
                     $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
                     $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.ASE . fmap F.rcast . ACS.ageSexEducation)
   tractIds <-  logTime "Ids to list" (FL.fold (FL.premap (view GT.tractId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
-  let n = (FL.fold FL.length tractIds)
+  tractIds' <-  logTime "Ids to list (II)" (FL.fold (FL.premap (view GT.tractId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
+  let n = FL.fold FL.length tractIds
   K.logLE K.Info $  "Loaded " <> show n <> " rows; " <> show (n `div` 40) <> " tracts."
---  K.logLE K.Info $ "IDs: " <> show tractIds
-
-
-  (training_C, testing_C) <- logTime "Training/testing split"
-                             $ KC.wctSplit
-                             $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.tractId)) allTractsASE_C
-  testTracts <- K.ignoreCacheTime testing_C
   let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
   nullVecsSVD <- K.knitMaybe "asAE_Tracts_Avg: Problem constructing SVD nullVecs. Bad marginal subsets?"
                  $  DTP.nullVecsMS ms Nothing
 
-  let covFld :: FL.Fold (F.Record (DMC.ASE V.++ '[DT.PopCount, DT.PWPopPerSqMile])) [Double]
-      covFld = fmap VS.toList $ DMC.innerFoldWD (F.rcast @DMC.AS) (F.rcast @DMC.AE)
-      popVecFld = DED.vecFld getSum (Sum . realToFrac . view DT.popCount) (F.rcast @DMC.ASE)
-      popFld = FL.premap (realToFrac . view DT.popCount) FL.sum
-      safeDiv x y = if y /= 0 then x / y else 0
-      alphaFld nv = (\p -> VS.toList . DTP.fullToProj nv . VS.map (flip safeDiv p)) <$> popFld <*> popVecFld
-      alphaCovInner nv k = (\as cs -> AlphaCov (k ^. GT.stateAbbreviation) (k ^. GT.tractId) as cs) <$> alphaFld nv <*> covFld
-      alphaCovFld :: DTP.NullVectorProjections (F.Record DMC.ASE) -> FL.Fold (F.Record (DMC.TractRowR DMC.ASE)) [AlphaCov]
-      alphaCovFld nv = MR.mapReduceFold
-                       MR.noUnpack
-                       (MR.assign (F.rcast @[GT.StateAbbreviation, GT.TractId]) (F.rcast @(DMC.ASE V.++ '[DT.PopCount, DT.PWPopPerSqMile])))
-                       (MR.ReduceFold $ alphaCovInner nv)
-      alphaCovs nv = FL.fold (alphaCovFld nv) testTracts
-      avgAlphaFld n = FL.premap (\ac -> acAlphas ac List.!! n) FL.mean
-      avgAlphasFld = fmap VS.fromList $ traverse avgAlphaFld [0..119]
-      avgAlphas nv = FL.fold avgAlphasFld $ alphaCovs nv
-      avgChange nv = zip (S.toList $ Keyed.elements @(F.Record DMC.ASE)) $ VS.toList $ DTP.projToFull nv (avgAlphas nv)
-      showKey k = T.intercalate ", " $ [show (k ^. DT.age5C), show (k ^. DT.sexC), show (k ^. DT.education4C)]
+  (testM, testProductsM, trainingM, trainingProductsM) <-
+    buildCachedTestTrain @[GT.StateAbbreviation, GT.TractId] (view GT.stateAbbreviation) (view GT.tractId) ms "test/demographics/Tracts_AS_AE/" allTractsASE_C
+  let nTest = LA.cols testM
+  K.logLE K.Info $ "N_testing = " <> show nTest <> "; N_training = " <> show (LA.cols trainingM)
 
-  K.logLE K.Info $ "Computing total deviation of products..."
-  let tractsToMatFld :: FL.Fold (F.Record (DMC.TractRowR DMC.ASE)) (LA.Matrix Double)
-      tractsToMatFld = labeledToMatFld (F.rcast @[GT.StateAbbreviation, GT.TractId]) (F.rcast @DMC.ASE) (realToFrac . view DT.popCount)
-      tractsToProdMatFld :: FL.Fold (F.Record (DMC.TractRowR DMC.ASE)) (LA.Matrix Double)
-      tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @[GT.StateAbbreviation, GT.TractId]) (F.rcast @DMC.ASE) DTM3.cwdF
-  (testM, testProductsM) <- logTime "test -> matrices & product matrices"
-                            $ fmap (first matrix . second matrix)
-                            $ K.ignoreCacheTimeM
-                            $ BRCC.retrieveOrMakeD "test/AS_AE/tracts/matricesTesting.bin" testing_C $ \x -> do
-    let (pumas, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ fmap F.rcast x
-    pure $ (FlatMatrix pumas, FlatMatrix products)
+  reportErrors "Product" testM testProductsM
+  let trainingAlpha = trueAlpha nullVecsSVD trainingM trainingProductsM
+      aaModel = averageAlphaModel trainingAlpha
+--      slsqp = euclideanSLSQP nullVecsSVD
+  aa <- logTime "<alpha>" $ estimate nullVecsSVD aaModel noOnSimplex testProductsM testProductsM
+  reportErrors "<alpha>" testM aa
+  aaOS <- logTime "OS(<alpha>)" $ estimate nullVecsSVD aaModel (nearestOnSimplex nullVecsSVD) testProductsM testProductsM
+  reportErrors "OS(<alpha>)" testM aaOS
+  aaSLSQP <- logTime "SLSQP(<alpha>)" $ estimate nullVecsSVD aaModel (euclideanSLSQP nullVecsSVD) testProductsM testProductsM
+  reportErrors "SLSQP(<alpha>)" testM aaSLSQP
 
-  (trainingM, trainingProductsM) <- logTime "training -> matrices & product matrices"
-                                    $ fmap (first matrix . second matrix)
-                                    $ K.ignoreCacheTimeM
-                                    $ BRCC.retrieveOrMakeD "test/AS_AE/tracts/matricesTraining.bin" training_C $ \x -> do
-    let (pumas, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ fmap F.rcast x
-    pure $ (FlatMatrix pumas, FlatMatrix products)
+--  wSLSQP <- logTime "wSLSQP(<alpha>; 1/sqrt(x))" $ estimate nullVecsSVD aaModel (weightedSLSQP nullVecsSVD (\x -> 1/sqrt x)) testProductsM testProductsM
+--  reportErrors "wSLSQP(<alpha>; 1/sqrt(x))" testM wSLSQP
 
-  let totalDeviations x = zipWith totalDeviation (LA.toColumns testM) (LA.toColumns x)
-      avgDeviation x = FL.fold FL.mean $ totalDeviations x
-      avgDeviation' x = FL.fold FL.mean $ filter (not . isNaN) $ totalDeviations x
-      nTracts = LA.cols testM
-  K.logLE K.Info $ "testing: N_tracts=" <> show nTracts
-
-  logTime "" $ K.logLE K.Info $ "product <deviation>=" <> show (avgDeviation testProductsM)
-  logTime "" $ K.logLE K.Info $ "product <|bias|>=" <> show (avgAbsBias testM testProductsM)
-  let toJoint nv alphas = testProductsM + DTP.projToFullM nv LA.<> alphas
-      diffs = trainingM - trainingProductsM
-      alphasSVD = DTP.fullToProjM nullVecsSVD LA.<> diffs
-      (meanAlphaSVD, covAlphaSVD) = LA.meanCov $ LA.tr alphasSVD
-  let prodAvgAlpha = toJoint nullVecsSVD (LA.fromColumns$ replicate nTracts meanAlphaSVD )
-  logTime "" $ K.logLE K.Info $ "AA <deviation>=" <> show (avgDeviation prodAvgAlpha)
-  K.logLE K.Info $ "doing weight vector optimization"
-  let owOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nV aV pV
-      owOptimizerData x = zip (LA.toColumns testProductsM) (replicate nTracts x)
-  aaOWSVD <- logTime "Weights (SVD)" (LA.fromColumns <$> (traverse (owOptimize nullVecsSVD) $ owOptimizerData meanAlphaSVD))
-  K.logLE K.Info $ "AAOW <deviation>=" <> show (avgDeviation $ toJoint nullVecsSVD aaOWSVD)
-  K.logLE K.Info $ "AAOW <|bias|>=" <> show (avgAbsBias (toJoint nullVecsSVD aaOWSVD) testM)
-  {-
+{-
   trainingTracts <- K.ignoreCacheTime training_C
   tractASEToCSV "Tracts_ASE_Training.csv" $ fmap F.rcast trainingTracts
   testTracts <- K.ignoreCacheTime testing_C
@@ -1808,7 +1860,7 @@ main = do
 -}
 --    compareCSR_ASR cmdLine postInfo
     asAE_Tracts_Avg
---    asAE_average_stuff
+    asAE_average_stuff
 --    DED.mapPE $ compareAS_AE cmdLine postInfo
 --    DED.mapPE $ compareAS_AR cmdLine postInfo
 --    asrASE_average_stuff
