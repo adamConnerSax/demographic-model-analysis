@@ -980,6 +980,32 @@ asrASE_average_stuff = do
 type TractGeoR = [BRDF.Year, GT.StateAbbreviation, GT.TractId]
 type TractRow ks = ACS.CensusRow ACS.TractLocationR ACS.CensusDataR ks
 
+cachedFullAndProduct :: forall ls ks rs r .
+                        (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
+                        , F.ElemOf rs DT.PopCount
+                        , F.ElemOf rs DT.PWPopPerSqMile
+                        , ks F.⊆ rs, ls F.⊆ rs
+                        , Ord (F.Record ls)
+                        , Ord (F.Record ks)
+                        , Keyed.FiniteSet (F.Record ks)
+                        )
+                     => DMS.MarginalStructure DMS.CellWithDensity (F.Record ks)
+                     -> Text
+                     -> Text
+                     -> K.ActionWithCacheTime r (F.FrameRec rs)
+                     -> K.Sem r (LA.Matrix Double, LA.Matrix Double)
+cachedFullAndProduct ms cachePrefix cacheLabel rows_C = do
+  let logTime = K.logTime (K.logLE K.Info)
+      tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+      tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
+      tractsToProdMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+      tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @ls) (F.rcast @ks) DTM3.cwdF
+  logTime (cacheLabel <> " -> matrices & product matrices")
+    $ fmap (first matrix . second matrix)
+    $ K.ignoreCacheTimeM
+    $ BRCC.retrieveOrMakeD (cachePrefix <> "matrices" <> cacheLabel <> ".bin") rows_C $ \x -> do
+        let (full, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ x --fmap F.rcast x
+        pure $ (FlatMatrix full, FlatMatrix products)
 
 buildCachedTestTrain :: forall ls ks rs a b r .
                         (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
@@ -1003,19 +1029,8 @@ buildCachedTestTrain splitRegion splitId ms cachePrefix rows_C = do
                              $ KC.wctSplit
                              $ KC.wctBind (splitGEOs testHalf splitRegion splitId) rows_C
 
-  let tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
-      tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
-      tractsToProdMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
-      tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @ls) (F.rcast @ks) DTM3.cwdF
-      matrices t dat_C = logTime (t <> " -> matrices & product matrices")
-                         $ fmap (first matrix . second matrix)
-                         $ K.ignoreCacheTimeM
-                         $ BRCC.retrieveOrMakeD (cachePrefix <> "matrices" <> t <> ".bin") dat_C $ \x -> do
-        let (pumas, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ x --fmap F.rcast x
-        pure $ (FlatMatrix pumas, FlatMatrix products)
-
-  (testM, testPM) <- matrices "Test" testing_C
-  (trainM, trainPM) <- matrices "Train" training_C
+  (testM, testPM) <- cachedFullAndProduct @ls ms cachePrefix "Test" testing_C --matrices "Test" testing_C
+  (trainM, trainPM) <- cachedFullAndProduct @ls ms cachePrefix "Train" training_C --matrices "Train" training_C
   pure (testM, testPM, trainM, trainPM)
 
 -- covariates to alphas
@@ -1024,6 +1039,16 @@ type AlphaModel r = LA.Vector Double -> K.Sem r (LA.Vector Double)
 averageAlphaModel :: LA.Matrix Double -> AlphaModel r
 averageAlphaModel rawAlphaM = const $ pure mean
   where (mean, _) = LA.meanCov $ LA.tr rawAlphaM
+
+-- NB: our inputs are one column per geography but
+-- W'W \beta = W'A is written for the transposes of the
+alphaProductLR :: LA.Matrix Double -> LA.Matrix Double -> AlphaModel r
+alphaProductLR pM aM  = pure . (beta' LA.#>)
+  where
+    w = LA.tr pM
+    wTw = LA.mTm w
+    wChol = LA.chol wTw
+    beta' = LA.tr $ LA.cholSolve wChol $ pM LA.<> LA.tr aM
 
 -- matrix of covariates to matrix of alphas
 applyAlphaModel :: AlphaModel r -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
@@ -1047,6 +1072,9 @@ nearestOnSimplex nvps pM aM = pure $ DTP.fullToProj nvps $ DTP.projectToSimplex 
 euclideanSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex r
 euclideanSLSQP nvps pM aM = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nvps aM pM
 
+nnls :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex r
+nnls nvps pV aV = DED.mapPE $ DTP.optimalWeightsAS DTP.defaultActiveSetConfig Nothing Nothing nvps aV pV
+
 weightedSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> (Double -> Double) -> OnSimplex r
 weightedSLSQP nvps f pM aM = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nvps aM pM
 
@@ -1059,36 +1087,89 @@ estimates nvps pM aM = pM + DTP.projToFullM nvps LA.<> aM
 estimate :: DTP.NullVectorProjections k -> AlphaModel r -> OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
 estimate nvps am os covM pM = fmap (estimates nvps pM) $ modelAndSimplex am os covM pM
 
-asAE_Tracts_Avg :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
-asAE_Tracts_Avg = do
+asAE_Tracts :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
+asAE_Tracts = do
+  K.logLE K.Info "Tracts"
   let logTime = K.logTime (K.logLE K.Info)
   tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
   allTractsASE_C <- logTime "Aggregate..."
                     $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
                     $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.ASE . fmap F.rcast . ACS.ageSexEducation)
-  tractIds <-  logTime "Ids to list" (FL.fold (FL.premap (view GT.tractId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
-  tractIds' <-  logTime "Ids to list (II)" (FL.fold (FL.premap (view GT.tractId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
+  tractIds <-  logTime "Ids to list (load cached data)" (FL.fold (FL.premap (view GT.tractId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
   let n = FL.fold FL.length tractIds
   K.logLE K.Info $  "Loaded " <> show n <> " rows; " <> show (n `div` 40) <> " tracts."
   let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
   nullVecsSVD <- K.knitMaybe "asAE_Tracts_Avg: Problem constructing SVD nullVecs. Bad marginal subsets?"
                  $  DTP.nullVecsMS ms Nothing
 
-  (testM, testProductsM, trainingM, trainingProductsM) <-
-    buildCachedTestTrain @[GT.StateAbbreviation, GT.TractId] (view GT.stateAbbreviation) (view GT.tractId) ms "test/demographics/Tracts_AS_AE/" allTractsASE_C
-  let nTest = LA.cols testM
-  K.logLE K.Info $ "N_testing = " <> show nTest <> "; N_training = " <> show (LA.cols trainingM)
+  (te, teP, tr, trP) <- buildCachedTestTrain @[GT.StateAbbreviation, GT.TractId] (view GT.stateAbbreviation) (view GT.tractId) ms "test/demographics/Tracts_AS_AE/" allTractsASE_C
+  reportVariations nullVecsSVD (te, teP) (tr, trP)
 
+asAE_PUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
+asAE_PUMAs = do
+  K.logLE K.Info "PUMAs"
+  let logTime = K.logTime (K.logLE K.Info)
+      (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+  allPUMAs_C <- logTime "PUMA data to cache"
+                 $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
+                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
+  let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD'
+  nullVecsSVD <- K.knitMaybe "asAE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
+                 $  DTP.nullVecsMS ms Nothing
+
+  K.logLE K.Info "PUMAs"
+  (te, teP, tr, trP) <- buildCachedTestTrain @[GT.StateAbbreviation, GT.PUMA] (view GT.stateAbbreviation) (view GT.pUMA) ms "test/demographics/PUMAs_AS_AE/" allPUMAs_C
+  reportVariations nullVecsSVD (te, teP) (tr, trP)
+
+
+asAE_TractsFromPUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
+asAE_TractsFromPUMAs = do
+  K.logLE K.Info "Tracts from PUMAs"
+  let logTime = K.logTime (K.logLE K.Info)
+      ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
+  tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
+  allTractsASE_C <- logTime "Aggregate..."
+                    $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
+                    $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.ASE . fmap F.rcast . ACS.ageSexEducation)
+  tractMs <- cachedFullAndProduct @[GT.StateAbbreviation, GT.TractId] ms "test/demographics/Tracts_AS_AE/" "Full" allTractsASE_C
+  let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+  allPUMAsASE_C <- logTime "PUMA data to cache"
+                   $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
+                   <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
+  pumaMs <- cachedFullAndProduct  @[GT.StateAbbreviation, GT.PUMA] ms "test/demographics/PUMAs_AS_AE/" "Full" allPUMAsASE_C
+   -- use PUMAs to train, tracts to test
+  nullVecsSVD <- K.knitMaybe "asAE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
+                 $  DTP.nullVecsMS ms Nothing
+  reportVariations nullVecsSVD tractMs pumaMs
+
+
+reportVariations :: (K.KnitMany r, K.KnitEffects r)
+                 => DTP.NullVectorProjections k -> (LA.Matrix Double, LA.Matrix Double) -> (LA.Matrix Double, LA.Matrix Double) -> K.Sem r()
+reportVariations nullVecs (testM, testProductsM) (trainingM, trainingProductsM) = do
+  let nTest = LA.cols testM
+      nCells = LA.rows testM
+      logTime = K.logTime (K.logLE K.Info)
+  K.logLE K.Info $ "N_testing = " <> show nTest <> "; N_training = " <> show (LA.cols trainingM)
   reportErrors "Product" testM testProductsM
-  let trainingAlpha = trueAlpha nullVecsSVD trainingM trainingProductsM
+{-  let testingAlpha = trueAlpha nullVecs testM testProductsM
+      ta2M = LA.tr testingAlpha LA.<> testingAlpha
+      ta2V = LA.takeDiag ta2M
+      ta2 = VS.sum (VS.map sqrt ta2V) / realToFrac (VS.length ta2V)
+  K.logLE K.Info $ "E[||alpha||_2] = " <> show ta2 <> "; E[||alpha||_2]/sqrt(N)=" <> show (ta2 / sqrt(realToFrac nCells))
+-}
+  let trainingAlpha = trueAlpha nullVecs trainingM trainingProductsM
       aaModel = averageAlphaModel trainingAlpha
---      slsqp = euclideanSLSQP nullVecsSVD
-  aa <- logTime "<alpha>" $ estimate nullVecsSVD aaModel noOnSimplex testProductsM testProductsM
+  aa <- logTime "<alpha>" $ estimate nullVecs aaModel noOnSimplex testProductsM testProductsM
   reportErrors "<alpha>" testM aa
-  aaOS <- logTime "OS(<alpha>)" $ estimate nullVecsSVD aaModel (nearestOnSimplex nullVecsSVD) testProductsM testProductsM
+  aaOS <- logTime "OS(<alpha>)" $ estimate nullVecs aaModel (nearestOnSimplex nullVecs) testProductsM testProductsM
   reportErrors "OS(<alpha>)" testM aaOS
-  aaSLSQP <- logTime "SLSQP(<alpha>)" $ estimate nullVecsSVD aaModel (euclideanSLSQP nullVecsSVD) testProductsM testProductsM
+  aaSLSQP <- logTime "SLSQP(<alpha>)" $ estimate nullVecs aaModel (euclideanSLSQP nullVecs) testProductsM testProductsM
   reportErrors "SLSQP(<alpha>)" testM aaSLSQP
+--  aaNNLS <- logTime "NNLS(<alpha>)" $ estimate nullVecs aaModel (nnls nullVecs) testProductsM testProductsM
+--  reportErrors "NNLS(<alpha>)" testM aaNNLS
+  let alphaLRModel = alphaProductLR trainingProductsM trainingAlpha
+  lraSLSQP <- logTime "SLSQP(alpha_LR)" $ estimate nullVecs alphaLRModel (euclideanSLSQP nullVecs) testProductsM testProductsM
+  reportErrors "SLSQP(alpha_LR)" testM lraSLSQP
 
 --  wSLSQP <- logTime "wSLSQP(<alpha>; 1/sqrt(x))" $ estimate nullVecsSVD aaModel (weightedSLSQP nullVecsSVD (\x -> 1/sqrt x)) testProductsM testProductsM
 --  reportErrors "wSLSQP(<alpha>; 1/sqrt(x))" testM wSLSQP
@@ -1859,8 +1940,10 @@ main = do
     DMC.checkCensusTables filteredCensusTables_C
 -}
 --    compareCSR_ASR cmdLine postInfo
-    asAE_Tracts_Avg
-    asAE_average_stuff
+    asAE_Tracts
+    asAE_PUMAs
+    asAE_TractsFromPUMAs
+--    asAE_average_stuff
 --    DED.mapPE $ compareAS_AE cmdLine postInfo
 --    DED.mapPE $ compareAS_AR cmdLine postInfo
 --    asrASE_average_stuff
