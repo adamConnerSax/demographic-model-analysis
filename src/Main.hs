@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -70,6 +71,7 @@ import qualified Control.Foldl as FL
 import qualified Control.Foldl.Statistics as FLS
 import qualified Frames as F
 import qualified Frames.Melt as F
+import qualified Frames.Transform as FT
 import qualified Frames.Streamly.InCore as FSI
 import qualified Frames.Streamly.CSV as FCSV
 import qualified Frames.Streamly.Streaming.Streamly as FSS
@@ -118,6 +120,8 @@ instance Semigroup CountWithDensity where
 instance Monoid CountWithDensity where
   mempty = CountWithDensity 0 0
 
+logTime :: K.KnitEffects r => Text -> K.Sem r a -> K.Sem r a
+logTime = K.logTiming (K.logLE K.Info)
 
 {-
 recToCWD :: F.Record [DT.PopCount, DT.PWPopPerSqMile] -> CountWithDensity
@@ -446,6 +450,7 @@ testNS onSimplexM modelIdE predictionCacheDirE meanOrModelF testRowKeyText cmdLi
 --      iso :: DMS.IsomorphicKeys (F.Record ks) (F.Record (qs V.++ as V.++ bs)) = DMS.IsomorphicKeys F.rcast F.rcast
 --  K.logLE K.Diagnostic $ "testNS: list permutation of [1,2,3,..] is " <> (show $ DTP.permuteList iso [1..])
   (predictions_C, products_C) <- DMC.predictedTables @outerK @qs @as @bs
+                                 DMS.PosConstrainedDensity
                                  onSimplexM
                                  predictionCacheDirE
                                  (pure . view GT.stateAbbreviation)
@@ -661,7 +666,7 @@ compareCSR_ASR cmdLine postInfo = do
 
 --    byPUMA <- K.ignoreCacheTime byPUMA_C
     pumaTest_C <- testNS @DMC.PUMAOuterKeyR @DMC.CASR @'[DT.CitizenC] @'[DT.Age5C]
-                  (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
+                  (DTP.viaOptimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull)
                   (Right "CSR_ASR_ByPUMA")
                   (Right "model/demographic/csr_asr_PUMA")
                   (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
@@ -705,7 +710,7 @@ compareCSR_ASR cmdLine postInfo = do
 
     (cdProduct, cdModeled) <- K.ignoreCacheTimeM
                               $ testNS @DMC.CDOuterKeyR @DMC.CASR @'[DT.CitizenC] @'[DT.Age5C]
-                              (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
+                              (DTP.viaOptimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull)
                               (Right "CSR_ASR_ByPUMA")
                               (Right "model/demographic/csr_asr_PUMA")
                               (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
@@ -933,7 +938,6 @@ asrASE_average_stuff = do
           Left msg -> K.knitError msg
           Right x -> pure x
       asOptimize nV mLSI_E (pV, aV) = DED.mapPE $ DTP.optimalWeightsAS nnlsConfig Nothing mLSI_E nV aV pV
-      logTime = K.logTime (K.logLE K.Info)
 --  aaASTensor <- LA.fromColumns <$> (traverse (asOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
   aaASSVD <- logTime "NNLS" (LA.fromColumns <$> (traverse (asOptimize nullVecsSVD Nothing) $ owOptimizerDataSVD))
   K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
@@ -954,7 +958,7 @@ asrASE_average_stuff = do
 -}
   K.logLE K.Info $ "doing weight vector optimization"
   let owOptimizerDataTensor = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlphaTensor)
-      owOptimize nv (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nv aV pV
+      owOptimize nv (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull nv aV pV
   aaOWSVD' <- logTime "SLSQP" (LA.fromColumns <$> traverse (owOptimize nullVecsSVD) owOptimizerDataSVD)
 --  aaOWTensor' <- LA.fromColumns <$> traverse (owOptimize nullVecsTensor) owOptimizerDataTensor
   let aaOWSVD = pumaProductsTM + DTP.projToFullM nullVecsSVD LA.<> aaOWSVD'
@@ -963,7 +967,7 @@ asrASE_average_stuff = do
 --  K.logLE K.Info $ "Tensor: avg AAOW deviation=" <> show (avgDeviation aaOWTensor)
 
   K.logLE K.Info $ "doing weight vector optimization, invWeight"
-  let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nV aV pV
+  let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig (DTP.euclideanWeighted f) nV aV pV
       tryF t f = do
         aaIWSVD <- logTime "weighted SLSQP" (LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) owOptimizerDataSVD))
         K.logLE K.Info $ "avg SVD AAIW deviation (f is " <> t <> ")=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaIWSVD)
@@ -977,8 +981,31 @@ asrASE_average_stuff = do
   pure ()
 --      allPUMAMat = FL.fold pumasToMatFld testPUMAs
 
-type TractGeoR = [BRDF.Year, GT.StateAbbreviation, GT.TractId]
+type TractGeoR = [BRDF.Year, GT.StateAbbreviation, GT.TractGeoId]
 type TractRow ks = ACS.CensusRow ACS.TractLocationR ACS.CensusDataR ks
+
+cachedAsMatrix :: forall ls ks rs r .
+                        (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
+                        , F.ElemOf rs DT.PopCount
+                        , F.ElemOf rs DT.PWPopPerSqMile
+                        , ks F.⊆ rs, ls F.⊆ rs
+                        , Ord (F.Record ls)
+                        , Ord (F.Record ks)
+                        , Keyed.FiniteSet (F.Record ks)
+                        )
+                     => Text
+                     -> Text
+                     -> K.ActionWithCacheTime r (F.FrameRec rs)
+                     -> K.Sem r (LA.Matrix Double)
+cachedAsMatrix cachePrefix cacheLabel rows_C = do
+  let tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+      tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
+  logTime (cacheLabel <> " -> to cached matrix")
+    $ fmap matrix
+    $ K.ignoreCacheTimeM
+    $ BRCC.retrieveOrMakeD (cachePrefix <> cacheLabel <> ".bin") rows_C $ \x -> do
+        let m = FL.fold tractsToMatFld x --fmap F.rcast x
+        pure $ FlatMatrix m
 
 cachedFullAndProduct :: forall ls ks rs r .
                         (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
@@ -995,8 +1022,7 @@ cachedFullAndProduct :: forall ls ks rs r .
                      -> K.ActionWithCacheTime r (F.FrameRec rs)
                      -> K.Sem r (LA.Matrix Double, LA.Matrix Double)
 cachedFullAndProduct ms cachePrefix cacheLabel rows_C = do
-  let logTime = K.logTime (K.logLE K.Info)
-      tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+  let tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
       tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
       tractsToProdMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
       tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @ls) (F.rcast @ks) DTM3.cwdF
@@ -1024,7 +1050,6 @@ buildCachedTestTrain :: forall ls ks rs a b r .
                      -> K.ActionWithCacheTime r (F.FrameRec rs)
                      -> K.Sem r (LA.Matrix Double, LA.Matrix Double, LA.Matrix Double, LA.Matrix Double)
 buildCachedTestTrain splitRegion splitId ms cachePrefix rows_C = do
-  let logTime = K.logTime (K.logLE K.Info)
   (training_C, testing_C) <- logTime "Training/testing split"
                              $ KC.wctSplit
                              $ KC.wctBind (splitGEOs testHalf splitRegion splitId) rows_C
@@ -1070,13 +1095,13 @@ nearestOnSimplex :: DTP.NullVectorProjections k  -> OnSimplex r
 nearestOnSimplex nvps pM aM = pure $ DTP.fullToProj nvps $ DTP.projectToSimplex (pM + DTP.projToFull nvps aM)
 
 euclideanSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex r
-euclideanSLSQP nvps pM aM = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nvps aM pM
+euclideanSLSQP nvps pM aM = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull nvps aM pM
 
 nnls :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex r
 nnls nvps pV aV = DED.mapPE $ DTP.optimalWeightsAS DTP.defaultActiveSetConfig Nothing Nothing nvps aV pV
 
 weightedSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> (Double -> Double) -> OnSimplex r
-weightedSLSQP nvps f pM aM = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nvps aM pM
+weightedSLSQP nvps f pM aM = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig (DTP.euclideanWeighted f) nvps aM pM
 
 modelAndSimplex :: AlphaModel r -> OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
 modelAndSimplex am os covM pM = applyAlphaModel am covM >>= \aM -> applyOnSimplex os pM aM
@@ -1090,26 +1115,71 @@ estimate nvps am os covM pM = fmap (estimates nvps pM) $ modelAndSimplex am os c
 asAE_Tracts :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
 asAE_Tracts = do
   K.logLE K.Info "Tracts"
-  let logTime = K.logTime (K.logLE K.Info)
   tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
   allTractsASE_C <- logTime "Aggregate..."
                     $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
                     $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.ASE . fmap F.rcast . ACS.ageSexEducation)
-  tractIds <-  logTime "Ids to list (load cached data)" (FL.fold (FL.premap (view GT.tractId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
+  tractIds <-  logTime "Ids to list (load cached data)" (FL.fold (FL.premap (view GT.tractGeoId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
   let n = FL.fold FL.length tractIds
   K.logLE K.Info $  "Loaded " <> show n <> " rows; " <> show (n `div` 40) <> " tracts."
   let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
   nullVecsSVD <- K.knitMaybe "asAE_Tracts_Avg: Problem constructing SVD nullVecs. Bad marginal subsets?"
                  $  DTP.nullVecsMS ms Nothing
 
-  (te, teP, tr, trP) <- buildCachedTestTrain @[GT.StateAbbreviation, GT.TractId] (view GT.stateAbbreviation) (view GT.tractId) ms "test/demographics/Tracts_AS_AE/" allTractsASE_C
+  (te, teP, tr, trP) <- buildCachedTestTrain @[GT.StateAbbreviation, GT.TractGeoId] (view GT.stateAbbreviation) (view GT.tractGeoId) ms "test/demographics/Tracts_AS_AE/" allTractsASE_C
   reportVariations nullVecsSVD (te, teP) (tr, trP)
+
+
+csrASR_Tracts :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => Int -> K.Sem r ()
+csrASR_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
+  K.logLE K.Info "Loading PUMAs as reference geography"
+  let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+  pumaSRCA_C <- logTime "PUMA data to cache"
+                 $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.SRCA . fmap F.rcast)
+                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
+  let ms  = DMC.marginalStructure @DMC.SRCA  @'[DT.CitizenC] @'[DT.Age5C] @DMS.CellWithDensity @[DT.SexC, DT.Race5C] DMS.cwdWgtLens DMS.innerProductCWD
+  (pumaSRCA_Full, pumaSRCA_Prod) <- cachedFullAndProduct @[GT.StateAbbreviation, GT.PUMA] ms "test/demographics/PUMA_SRCA/" "FullProd" pumaSRCA_C
+  alphaModelLR <- logTime "Building alphaModel via LR" $ pure $ alphaProductLR pumaSRCA_Full pumaSRCA_Prod
+  tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
+  tractsCSR <- cachedAsMatrix @TractGeoR @DMC.CSR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
+               $ fmap (DMC.recodeCSR @TractGeoR . fmap F.rcast)
+               $ fmap ACS.citizenshipSexRace tractTables_C
+  tractsA6SR <- cachedAsMatrix @TractGeoR @DMC.A6SR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
+               $ fmap (DMC.recodeA6SR @TractGeoR . fmap F.rcast)
+               $ fmap ACS.ageSexRace tractTables_C
+{-
+    logTime "tracts to CSR matrix"
+                 $ fmap (fmap matrix)
+                 $ BRCC.retrieveOrMakeD "test/demographics/allTractsASE.bin" tractTables_C
+                 $ pure
+                 . FlatMatrix
+                 . FL.fold (labeledToMatFld (F.rcast @TractGeoR) (F.rcast @DMC.CSR) (realToFrac . view DT.popCount))
+                 . aggregateAndZeroFillTables @TractGeoR @DMC.CSR
+                 . fmap F.rcast
+                 . ACS.citizenshipSexRace
+-}
+{-
+  allTractsASR_C <- logTime "tractsToASR matrix"
+                    $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
+                    $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.CSR . fmap F.rcast . ACS.ageSexRace)
+-}
+{-
+  tractIds <-  logTime "Ids to list (load cached data)" (FL.fold (FL.premap (view GT.tractGeoId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
+  let n = FL.fold FL.length tractIds
+  K.logLE K.Info $  "Loaded " <> show n <> " rows; " <> show (n `div` 40) <> " tracts."
+  let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
+  nullVecsSVD <- K.knitMaybe "asAE_Tracts_Avg: Problem constructing SVD nullVecs. Bad marginal subsets?"
+                 $  DTP.nullVecsMS ms Nothing
+
+  (te, teP, tr, trP) <- buildCachedTestTrain @[GT.StateAbbreviation, GT.TractGeoId] (view GT.stateAbbreviation) (view GT.tractGeoId) ms "test/demographics/Tracts_AS_AE/" allTractsASE_C
+  reportVariations nullVecsSVD (te, teP) (tr, trP)
+-}
+  pure ()
 
 asAE_PUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
 asAE_PUMAs = do
   K.logLE K.Info "PUMAs"
-  let logTime = K.logTime (K.logLE K.Info)
-      (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+  let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
   allPUMAs_C <- logTime "PUMA data to cache"
                  $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
                  <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
@@ -1125,13 +1195,12 @@ asAE_PUMAs = do
 asAE_TractsFromPUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
 asAE_TractsFromPUMAs = do
   K.logLE K.Info "Tracts from PUMAs"
-  let logTime = K.logTime (K.logLE K.Info)
-      ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
+  let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
   tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
   allTractsASE_C <- logTime "Aggregate..."
                     $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
                     $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.ASE . fmap F.rcast . ACS.ageSexEducation)
-  tractMs <- cachedFullAndProduct @[GT.StateAbbreviation, GT.TractId] ms "test/demographics/Tracts_AS_AE/" "Full" allTractsASE_C
+  tractMs <- cachedFullAndProduct @[GT.StateAbbreviation, GT.TractGeoId] ms "test/demographics/Tracts_AS_AE/" "Full" allTractsASE_C
   let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
   allPUMAsASE_C <- logTime "PUMA data to cache"
                    $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
@@ -1148,7 +1217,6 @@ reportVariations :: (K.KnitMany r, K.KnitEffects r)
 reportVariations nullVecs (testM, testProductsM) (trainingM, trainingProductsM) = do
   let nTest = LA.cols testM
       nCells = LA.rows testM
-      logTime = K.logTime (K.logLE K.Info)
   K.logLE K.Info $ "N_testing = " <> show nTest <> "; N_training = " <> show (LA.cols trainingM)
   reportErrors "Product" testM testProductsM
 {-  let testingAlpha = trueAlpha nullVecs testM testProductsM
@@ -1295,7 +1363,6 @@ asAE_average_stuff = do
   K.logLE K.Info $ "doing full vector optimization"
   let optimize nv (p, t) = DED.mapPE $ DTP.optimalVector nv p t
       optimizerDataSVD = zip (LA.toColumns pumaProductsTM) (LA.toColumns aaOSSVD)
-      logTime = K.logTime (K.logLE K.Info)
   aaOVSVD <- logTime "Full Vector (SVD)" (LA.fromColumns <$> traverse (optimize nullVecsSVD) optimizerDataSVD)
   let avgAAOVDeviationSVD = FL.fold FL.mean $ totalDeviations aaOVSVD
   K.logLE K.Info $ "SVD: avg AAOV deviation=" <> show avgAAOVDeviationSVD
@@ -1305,7 +1372,7 @@ asAE_average_stuff = do
   K.logLE K.Info $ "Tensor: avg AAOV deviation=" <> show avgAAOVDeviationTensor
 
   K.logLE K.Info $ "doing weight vector optimization"
-  let owOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.euclideanFull 1e-4 nV aV pV
+  let owOptimize nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull nV aV pV
       owOptimizerData x = zip (LA.toColumns pumaProductsTM) (replicate nPUMA x)
       toJoint nv alphas = pumaProductsTM + DTP.projToFullM nv LA.<> alphas
   aaOWTensor <- logTime "Weights (Tensor)" (LA.fromColumns <$> (traverse (owOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor))
@@ -1314,7 +1381,7 @@ asAE_average_stuff = do
   K.logLE K.Info $ "avg SVD AAOW deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaOWSVD)
 
   K.logLE K.Info $ "doing weight vector optimization, invWeight"
-  let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights (DTP.euclideanWeighted f) 1e-4 nV aV pV
+  let iwOptimize f nV (pV, aV) = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig (DTP.euclideanWeighted f) nV aV pV
       tryF t f = do
         aaIWTensor <- logTime "Weighted (Tensor)" (LA.fromColumns <$> (traverse (iwOptimize f nullVecsTensor) $ owOptimizerData meanAlphaTensor))
         aaIWSVD <- logTime "Weighted (SVD)" (LA.fromColumns <$> (traverse (iwOptimize f nullVecsSVD) $ owOptimizerData meanAlphaSVD))
@@ -1418,7 +1485,7 @@ compareAS_AR cmdLine postInfo = do
     let testPUMAs_C = byPUMA_C
     testPUMAs <- K.ignoreCacheTime testPUMAs_C
 
-    let optimalOnSimplex = DTP.viaOptimalWeights DTP.euclideanFull 1e-4
+    let optimalOnSimplex = DTP.viaOptimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull
     (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
                                        $ KC.wctBind (splitGEOs testHalf (view GT.stateAbbreviation) (view GT.pUMA)) byPUMA_C
     pumaSVD_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASR @'[DT.SexC] @'[DT.Race5C]
@@ -1437,7 +1504,7 @@ compareAS_AR cmdLine postInfo = do
         catAndKnownsAll :: DNS.CatsAndKnowns (F.Record DMC.ASR) = DNS.CatsAndKnowns catMap
                                                                   [DNS.KnownMarginal "AS", DNS.KnownMarginal "AR"]
     pumaTensor_C <-  testNS @DMC.PUMAOuterKeyR @DMC.ASR @'[DT.SexC] @'[DT.Race5C]
-                     (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
+                     (DTP.viaOptimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull)
                      (Left  "AS_AR_tensor")
                      (Left  "model/demographic/AS_AR_tensor")
                      (const DTM3.Mean) --(DTM3.Model . tsModelConfig "AS_AE_tensor")
@@ -1548,7 +1615,7 @@ compareASR_ASE cmdLine postInfo = do
 --                 <$> DDP.cachedACSa5ByCD srcWindow cachedSrc 2020 Nothing
 --    testCDs <- K.ignoreCacheTime testCDs_C
 
-    let optimalOnSimplex = DTP.viaOptimalWeights DTP.euclideanFull 1e-4
+    let optimalOnSimplex = DTP.viaOptimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull
 --    let optimalOnSimplex = DTP.viaNearestOnSimplex
 --    let optimalOnSimplex = DTP.viaNearestOnSimplexPlus
 
@@ -1810,7 +1877,7 @@ compareCASR_ASE cmdLine postInfo = do
     byPUMA <- K.ignoreCacheTime byPUMA_C
     (product_CASR_ASE, modeled_CASR_ASE) <- K.ignoreCacheTimeM
                                           $ testNS @DMC.PUMAOuterKeyR @DMC.CASER @'[DT.CitizenC, DT.Race5C] @'[DT.Education4C]
-                                          (DTP.viaOptimalWeights DTP.euclideanFull 1e-4)
+                                          (DTP.viaOptimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull)
                                           (Right "CASR_ASE_ByPUMA")
                                           (Right "model/demographic/casr_ase")
                                           (DTM3.Model . tsModelConfig "CSR_ASR_ByPUMA")
@@ -2054,13 +2121,13 @@ pumaASERToCSV fileName rows = do
     $ FCSV.foldableToStream
     $ fmap F.rcast rows
 
-type TractASEToCsvR = [GT.StateAbbreviation, GT.TractId, DT.Age5C, DT.SexC, DT.Education4C, DT.PopCount]
+type TractASEToCsvR = [GT.StateAbbreviation, GT.TractGeoId, DT.Age5C, DT.SexC, DT.Education4C, DT.PopCount]
 
 
 tractASEToCSV :: K.KnitEffects r => Text -> F.FrameRec TractASEToCsvR -> K.Sem r ()
 tractASEToCSV fileName rows = do
   let newHeaderMap = M.fromList [("StateAbbreviation", "state")
-                                ,("TractId","tractId")
+                                ,("TractGeoId","tractId")
                                 , ("PopCount", "pop_count")
                                 , ("Age5C", "age_5")
                                 , ("SexC", "sex_2")
