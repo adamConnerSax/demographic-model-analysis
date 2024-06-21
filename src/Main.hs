@@ -38,6 +38,7 @@ import qualified BlueRipple.Data.Types.Geographic as GT
 import qualified BlueRipple.Data.Small.DataFrames as BRDF
 import qualified BlueRipple.Data.Small.Loaders as BRDF
 import qualified BlueRipple.Data.CachingCore as BRCC
+import qualified BlueRipple.Data.Keyed as BRK
 
 import qualified Knit.Report as K
 import qualified Knit.Effect.AtomicCache as KC
@@ -985,6 +986,28 @@ type TractGeoR = [BRDF.Year, GT.StateAbbreviation, GT.TractGeoId]
 type TractRow ks = ACS.CensusRow ACS.TractLocationR ACS.CensusDataR ks
 
 cachedAsMatrix :: forall ls ks rs r .
+                   (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
+                   , F.ElemOf rs DT.PopCount
+                   , F.ElemOf rs DT.PWPopPerSqMile
+                   , ks F.⊆ rs, ls F.⊆ rs
+                   , Ord (F.Record ls)
+                   , Ord (F.Record ks)
+                   , Keyed.FiniteSet (F.Record ks)
+                   )
+                => Text
+                -> Text
+                -> K.ActionWithCacheTime r (F.FrameRec rs)
+                -> K.Sem r (K.ActionWithCacheTime r (LA.Matrix Double))
+cachedAsMatrix cachePrefix cacheLabel rows_C = do
+  let tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+      tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
+  logTime (cacheLabel <> " -> to cached matrix")
+    $ fmap (fmap matrix)
+    $ BRCC.retrieveOrMakeD (cachePrefix <> cacheLabel <> ".bin") rows_C $ \x -> do
+        let m = FL.fold tractsToMatFld x --fmap F.rcast x
+        pure $ FlatMatrix m
+
+cachedFullAndProductC :: forall ls ks rs r .
                         (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
                         , F.ElemOf rs DT.PopCount
                         , F.ElemOf rs DT.PWPopPerSqMile
@@ -993,19 +1016,22 @@ cachedAsMatrix :: forall ls ks rs r .
                         , Ord (F.Record ks)
                         , Keyed.FiniteSet (F.Record ks)
                         )
-                     => Text
+                     => DMS.MarginalStructure DMS.CellWithDensity (F.Record ks)
+                     -> Text
                      -> Text
                      -> K.ActionWithCacheTime r (F.FrameRec rs)
-                     -> K.Sem r (LA.Matrix Double)
-cachedAsMatrix cachePrefix cacheLabel rows_C = do
+                     -> K.Sem r (K.ActionWithCacheTime r (LA.Matrix Double, LA.Matrix Double))
+cachedFullAndProductC ms cachePrefix cacheLabel rows_C = do
   let tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
       tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
-  logTime (cacheLabel <> " -> to cached matrix")
-    $ fmap matrix
-    $ K.ignoreCacheTimeM
-    $ BRCC.retrieveOrMakeD (cachePrefix <> cacheLabel <> ".bin") rows_C $ \x -> do
-        let m = FL.fold tractsToMatFld x --fmap F.rcast x
-        pure $ FlatMatrix m
+      tractsToProdMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
+      tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @ls) (F.rcast @ks) DTM3.cwdF
+  logTime (cacheLabel <> " -> matrices & product matrices")
+    $ fmap (fmap (first matrix . second matrix))
+    $ BRCC.retrieveOrMakeD (cachePrefix <> "matrices" <> cacheLabel <> ".bin") rows_C $ \x -> do
+        let (full, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ x --fmap F.rcast x
+        pure $ (FlatMatrix full, FlatMatrix products)
+
 
 cachedFullAndProduct :: forall ls ks rs r .
                         (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
@@ -1021,17 +1047,7 @@ cachedFullAndProduct :: forall ls ks rs r .
                      -> Text
                      -> K.ActionWithCacheTime r (F.FrameRec rs)
                      -> K.Sem r (LA.Matrix Double, LA.Matrix Double)
-cachedFullAndProduct ms cachePrefix cacheLabel rows_C = do
-  let tractsToMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
-      tractsToMatFld = labeledToMatFld (F.rcast @ls) (F.rcast @ks) (realToFrac . view DT.popCount)
-      tractsToProdMatFld :: FL.Fold (F.Record rs) (LA.Matrix Double)
-      tractsToProdMatFld = labeledToProdMatFld DMS.cwdWgtLens ms (F.rcast @ls) (F.rcast @ks) DTM3.cwdF
-  logTime (cacheLabel <> " -> matrices & product matrices")
-    $ fmap (first matrix . second matrix)
-    $ K.ignoreCacheTimeM
-    $ BRCC.retrieveOrMakeD (cachePrefix <> "matrices" <> cacheLabel <> ".bin") rows_C $ \x -> do
-        let (full, products) = FL.fold ((,) <$> tractsToMatFld <*> tractsToProdMatFld) $ x --fmap F.rcast x
-        pure $ (FlatMatrix full, FlatMatrix products)
+cachedFullAndProduct ms cachePrefix cacheLabel rows_C = cachedFullAndProductC @ls ms cachePrefix cacheLabel rows_C >>= K.ignoreCacheTime
 
 buildCachedTestTrain :: forall ls ks rs a b r .
                         (K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r
@@ -1057,6 +1073,14 @@ buildCachedTestTrain splitRegion splitId ms cachePrefix rows_C = do
   (testM, testPM) <- cachedFullAndProduct @ls ms cachePrefix "Test" testing_C --matrices "Test" testing_C
   (trainM, trainPM) <- cachedFullAndProduct @ls ms cachePrefix "Train" training_C --matrices "Train" training_C
   pure (testM, testPM, trainM, trainPM)
+
+products :: forall a b ok ika ikb k. (BRK.FiniteSet a, Ord a, BRK.FiniteSet b, Ord b,
+                                       BRK.FiniteSet ok, Ord k, BRK.FiniteSet ika, BRK.FiniteSet ikb, Ord ok, Ord ika, Ord ikb)
+         => (a -> (ok, ika)) -> (b -> (ok, ikb)) -> ((ok, ika, ikb) -> k) -> LA.Matrix Double -> LA.Matrix Double -> LA.Matrix Double
+products aKeys bKeys toK aM bM = LA.fromColumns $ zipWith f (LA.toColumns aM) (LA.toColumns bM) where
+  toMap :: forall c ikc . (BRK.FiniteSet c, Ord c, BRK.FiniteSet ikc, Ord ikc) => (c -> (ok, ikc)) -> LA.Vector Double -> Map ok (Map ikc (Sum Double))
+  toMap cKeys v = FL.fold DMS.tableMapFld $ zip (fmap cKeys $ S.toList $ BRK.elements @c) (fmap Sum $ VS.toList v)
+  f a b = VS.fromList $ fmap (getSum . snd) $ sortOn fst $ fmap (first toK) $ DMS.tableProductL DMS.innerProductSum (toMap aKeys a) (toMap bKeys b)
 
 -- covariates to alphas
 type AlphaModel r = LA.Vector Double -> K.Sem r (LA.Vector Double)
@@ -1137,16 +1161,29 @@ csrASR_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
   pumaSRCA_C <- logTime "PUMA data to cache"
                  $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.SRCA . fmap F.rcast)
                  <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
-  let ms  = DMC.marginalStructure @DMC.SRCA  @'[DT.CitizenC] @'[DT.Age5C] @DMS.CellWithDensity @[DT.SexC, DT.Race5C] DMS.cwdWgtLens DMS.innerProductCWD
-  (pumaSRCA_Full, pumaSRCA_Prod) <- cachedFullAndProduct @[GT.StateAbbreviation, GT.PUMA] ms "test/demographics/PUMA_SRCA/" "FullProd" pumaSRCA_C
-  alphaModelLR <- logTime "Building alphaModel via LR" $ pure $ alphaProductLR pumaSRCA_Full pumaSRCA_Prod
+  let ms  = DMC.marginalStructure @DMC.CASR  @'[DT.CitizenC] @'[DT.Age5C] @DMS.CellWithDensity @[DT.SexC, DT.Race5C] DMS.cwdWgtLens DMS.innerProductCWD
+  pumaFullAndProd_C <- cachedFullAndProductC @[GT.StateAbbreviation, GT.PUMA] ms "test/demographics/PUMA_CASR/" "FullProd" pumaSRCA_C
+  alphaModelSRCA_C <- logTime "Building alphaModel via LR"
+                      $ BRCC.retrieveOrMakeD "test/Demographics/tractsCSR_ASR/pumaAlphaModelLR" pumaFullAndProd_C
+                      $ \(full, prod) -> pure $ alphaProductLR full prod
   tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
-  tractsCSR <- cachedAsMatrix @TractGeoR @DMC.CSR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
-               $ fmap (DMC.recodeCSR @TractGeoR . fmap F.rcast)
-               $ fmap ACS.citizenshipSexRace tractTables_C
-  tractsA6SR <- cachedAsMatrix @TractGeoR @DMC.A6SR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
-               $ fmap (DMC.recodeA6SR @TractGeoR . fmap F.rcast)
-               $ fmap ACS.ageSexRace tractTables_C
+  tractsCSR_C <- cachedAsMatrix @TractGeoR @DMC.CSR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
+                 $ fmap (DMC.recodeCSR @TractGeoR . fmap F.rcast)
+                 $ fmap ACS.citizenshipSexRace tractTables_C
+  tractsASR_C <- cachedAsMatrix @TractGeoR @DMC.ASR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
+                 $ fmap (DMC.filterA6FrameToA5 .  DMC.recodeA6SR @TractGeoR . fmap F.rcast)
+                 $ fmap ACS.ageSexRace tractTables_C
+  let csrKeys :: F.Record DMC.CSR -> (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC])
+      csrKeys k = (F.rcast @'[DT.SexC, DT.Race5C] k, F.rcast @'[DT.CitizenC] k)
+      asrKeys :: F.Record DMC.ASR -> (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.Age5C])
+      asrKeys k = (F.rcast @'[DT.SexC, DT.Race5C] k, F.rcast @'[DT.Age5C] k)
+      toCASR :: (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC], F.Record '[DT.Age5C]) -> F.Record DMC.SRCA
+      toCASR (sr, c, a) = F.rcast @DMC.SRCA (sr F.<+> c F.<+> a)
+      prodDeps = (,) <$> tractsCSR_C <*> tractsASR_C
+  tractProd_CASR_C <- BRCC.retrieveOrMakeD "test/demographics/tractsCSR_ASR/tractProducts.bin" prodDeps
+                      $ \(csr, asr) -> pure $ FlatMatrix $ products csrKeys asrKeys toCASR csr asr
+
+
 {-
     logTime "tracts to CSR matrix"
                  $ fmap (fmap matrix)
