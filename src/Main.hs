@@ -38,6 +38,7 @@ import qualified BlueRipple.Data.Types.Geographic as GT
 import qualified BlueRipple.Data.Small.DataFrames as BRDF
 import qualified BlueRipple.Data.Small.Loaders as BRDF
 import qualified BlueRipple.Data.CachingCore as BRCC
+import qualified BlueRipple.Data.LoadersCore as BRLC
 import qualified BlueRipple.Data.Keyed as BRK
 
 import qualified Knit.Report as K
@@ -1154,23 +1155,31 @@ asAE_Tracts = do
   reportVariations nullVecsSVD (te, teP) (tr, trP)
 
 
-csrASR_Tracts :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => Int -> K.Sem r ()
+
+csrASR_Tracts :: forall r . (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => Int -> K.Sem r ()
 csrASR_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
+  let cacheDir =  "test/demographics/tractsCSR_ASR/"
   K.logLE K.Info "Loading PUMAs as reference geography"
-  let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
-  pumaSRCA_C <- logTime "PUMA data to cache"
-                 $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.SRCA . fmap F.rcast)
-                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
+  let (srcWindow, cachedSrc) = ACS.acs1Yr2012_22
+  puma_C <-  DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
+  pumaSRCA_C <- logTime "Full PUMA data to zero-filled SRCA"
+                $ BRCC.retrieveOrMakeFrame  (cacheDir <> "pumaSRCA.bin") puma_C
+                $ pure . aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.SRCA . fmap F.rcast
   let ms  = DMC.marginalStructure @DMC.CASR  @'[DT.CitizenC] @'[DT.Age5C] @DMS.CellWithDensity @[DT.SexC, DT.Race5C] DMS.cwdWgtLens DMS.innerProductCWD
-  pumaFullAndProd_C <- cachedFullAndProductC @[GT.StateAbbreviation, GT.PUMA] ms "test/demographics/PUMA_CASR/" "FullProd" pumaSRCA_C
-  alphaModelSRCA_C <- logTime "Building alphaModel via LR"
-                      $ BRCC.retrieveOrMakeD "test/Demographics/tractsCSR_ASR/pumaAlphaModelLR" pumaFullAndProd_C
-                      $ \(full, prod) -> pure $ alphaProductLR full prod
-  tractTables_C <- logTime "Load Tables" $ ACS.loadACS_2017_2022_Tracts
-  tractsCSR_C <- cachedAsMatrix @TractGeoR @DMC.CSR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
+  nullVecsSVD <-  logTime "Null Vecs"
+                  $ K.knitMaybe "asAE_average_stuff: Problem constructing nullVecs. Bad marginal subsets?"
+                  $ DTP.nullVecsMS ms Nothing
+  pumaFullAndProd_C <- cachedFullAndProductC @[GT.StateAbbreviation, GT.PUMA] ms cacheDir "PumaFullProd" pumaSRCA_C
+  pumaAlphas_C <- logTime "pumaSRCA_alphas"
+                  $ fmap (fmap matrix)
+                  $ BRCC.retrieveOrMakeD (cacheDir <> "pumaSRCA_alphas.bin") pumaFullAndProd_C
+                  $ \ (f, p) -> pure $ FlatMatrix $ trueAlpha nullVecsSVD f p
+
+  tractTables_C <- logTime "Load Tract Tables" $ ACS.loadACS_2017_2022_Tracts
+  tractsCSR_C <- cachedAsMatrix @TractGeoR @DMC.CSR cacheDir "tractCSRMatrix"
                  $ fmap (DMC.recodeCSR @TractGeoR . fmap F.rcast)
                  $ fmap ACS.citizenshipSexRace tractTables_C
-  tractsASR_C <- cachedAsMatrix @TractGeoR @DMC.ASR "test/demographics/tractsCSR_ASR/" "tractCSRMatrix"
+  tractsASR_C <- cachedAsMatrix @TractGeoR @DMC.ASR cacheDir "tractASRMatrix"
                  $ fmap (DMC.filterA6FrameToA5 .  DMC.recodeA6SR @TractGeoR . fmap F.rcast)
                  $ fmap ACS.ageSexRace tractTables_C
   let csrKeys :: F.Record DMC.CSR -> (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC])
@@ -1180,10 +1189,26 @@ csrASR_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
       toCASR :: (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC], F.Record '[DT.Age5C]) -> F.Record DMC.SRCA
       toCASR (sr, c, a) = F.rcast @DMC.SRCA (sr F.<+> c F.<+> a)
       prodDeps = (,) <$> tractsCSR_C <*> tractsASR_C
-  tractProd_CASR_C <- BRCC.retrieveOrMakeD "test/demographics/tractsCSR_ASR/tractProducts.bin" prodDeps
+  tractProd_CASR_C <- logTime "make tract products"
+                      $ fmap (fmap matrix)
+                      $ BRCC.retrieveOrMakeD (cacheDir  <> "tractProducts.bin") prodDeps
                       $ \(csr, asr) -> pure $ FlatMatrix $ products csrKeys asrKeys toCASR csr asr
+  numTracts <- logTime "counting tracts" $ (LA.cols <$> K.ignoreCacheTime tractsCSR_C)
+  testIndices <- randomIndices numTracts n
+  let testM m = m LA.?? (LA.All, LA.Pos $ LA.idxs testIndices)
+      predictAvg (pumaAlphas, tractProducts) =
+        let p = testM tractProducts
+        in estimate nullVecsSVD (averageAlphaModel pumaAlphas) (euclideanSLSQP nullVecsSVD) p p
+  avgPredictOW <- logTime ("Predict " <> show n <> " via optimal weights")
+                  $ K.ignoreCacheTime
+                  $ K.wctBind predictAvg $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
 
-
+--  K.ignoreCacheTime tractProd_CASR_C >>= K.logLE K.Info . show
+{-
+  alphaModelSRCA_C <- logTime "Building alphaModel via LR"
+                      $ BRCC.retrieveOrMakeD "test/Demographics/tractsCSR_ASR/pumaAlphaModelLR" pumaFullAndProd_C
+                      $ \(full, prod) -> pure $ alphaProductLR full prod
+-}
 {-
     logTime "tracts to CSR matrix"
                  $ fmap (fmap matrix)
@@ -1216,7 +1241,7 @@ csrASR_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
 asAE_PUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
 asAE_PUMAs = do
   K.logLE K.Info "PUMAs"
-  let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+  let (srcWindow, cachedSrc) = ACS.acs1Yr2012_22
   allPUMAs_C <- logTime "PUMA data to cache"
                  $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
                  <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
@@ -1238,7 +1263,7 @@ asAE_TractsFromPUMAs = do
                     $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
                     $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.ASE . fmap F.rcast . ACS.ageSexEducation)
   tractMs <- cachedFullAndProduct @[GT.StateAbbreviation, GT.TractGeoId] ms "test/demographics/Tracts_AS_AE/" "Full" allTractsASE_C
-  let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+  let (srcWindow, cachedSrc) = ACS.acs1Yr2012_22
   allPUMAsASE_C <- logTime "PUMA data to cache"
                    $ fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
                    <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
@@ -1290,7 +1315,7 @@ reportVariations nullVecs (testM, testProductsM) (trainingM, trainingProductsM) 
 
 asAE_average_stuff :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
 asAE_average_stuff = do
-  let (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+  let (srcWindow, cachedSrc) = ACS.acs1Yr2012_22
   testPUMAs_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
                  <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
   (pumaTraining_C, pumaTesting_C) <- KC.wctSplit
@@ -1453,7 +1478,7 @@ compareAS_AE :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.CacheEff
 compareAS_AE cmdLine postInfo = do
     K.logLE K.Info "Building test PUMA-level products for AS x AE -> ASE"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
-        (srcWindow, cachedSrc) = ACS.acs1Yr2010_20 @r
+        (srcWindow, cachedSrc) = ACS.acs1Yr2012_22 @r
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASE . fmap F.rcast)
                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
     let testPUMAs_C = byPUMA_C
@@ -1516,7 +1541,7 @@ compareAS_AR :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.CacheEff
 compareAS_AR cmdLine postInfo = do
     K.logLE K.Info "Building test PUMA-level products for AS x AR -> ASR"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
-        (srcWindow, cachedSrc) = ACS.acs1Yr2010_20 @r
+        (srcWindow, cachedSrc) = ACS.acs1Yr2012_22 @r
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASR . fmap F.rcast)
                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
     let testPUMAs_C = byPUMA_C
@@ -1579,7 +1604,7 @@ compareASR_ASE' :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.Cache
 compareASR_ASE' cmdLine postInfo = do
     K.logLE K.Info "Building test PUMA-level products for ASR x ASE -> ASER"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
-        (srcWindow, cachedSrc) = ACS.acs1Yr2010_20 @r
+        (srcWindow, cachedSrc) = ACS.acs1Yr2012_22 @r
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASER . fmap F.rcast)
                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
     let testPUMAs_C = byPUMA_C
@@ -1642,7 +1667,7 @@ compareASR_ASE :: forall r . (K.KnitMany r, DED.EnrichDataEffects r, BRCC.CacheE
 compareASR_ASE cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for ASR x ASE -> ASER"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
-        (srcWindow, cachedSrc) = ACS.acs1Yr2010_20 @r
+        (srcWindow, cachedSrc) = ACS.acs1Yr2012_22 @r
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASER . fmap F.rcast)
                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
     let testPUMAs_C = byPUMA_C
@@ -1904,7 +1929,7 @@ compareCASR_ASE :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.Co
 compareCASR_ASE cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for CASR x ASE -> CASER"
     let filterToState sa r = r ^. GT.stateAbbreviation == sa
-        (srcWindow, cachedSrc) =  ACS.acs1Yr2010_20
+        (srcWindow, cachedSrc) =  ACS.acs1Yr2012_22
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.CASER . fmap F.rcast)
                 <$> DDP.cachedACSa5ByPUMA srcWindow cachedSrc 2020
     let testPUMAs_C = {- fmap (F.filterFrame $ filterToState "RI") -} byPUMA_C
@@ -1957,9 +1982,9 @@ compareSER_ASR :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r) => BR.Com
 compareSER_ASR cmdLine postInfo = do
     K.logLE K.Info "Building test CD-level products for SER x A6SR -> A6SER"
     byPUMA_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.ASER . fmap F.rcast)
-                <$> DDP.cachedACSa5ByPUMA ACS.acs1Yr2010_20 2020
+                <$> DDP.cachedACSa5ByPUMA ACS.acs1Yr2012_22 2020
     byCD_C <- fmap (aggregateAndZeroFillTables @DDP.ACSByCDGeoR @DMC.ASER . fmap F.rcast)
-              <$> DDP.cachedACSa5ByCD ACS.acs1Yr2010_20 2020 Nothing
+              <$> DDP.cachedACSa5ByCD ACS.acs1Yr2012_22 2020 Nothing
     byCD <- K.ignoreCacheTime byCD_C
     byPUMA <- K.ignoreCacheTime byPUMA_C
     (product_SER_ASR, modeled_SER_ASR) <- K.ignoreCacheTimeM
@@ -2021,7 +2046,7 @@ main = do
         (K.defaultKnitConfig $ Just cacheDir)
           { K.outerLogPrefix = Just "2022-Demographics"
           , K.logIf = BR.knitLogSeverity $ BR.logLevel cmdLine -- K.logDiagnostic
---          , K.lcSeverity = M.fromList [("AlphaMismatch", K.Special)]
+          , K.lcSeverity = M.fromList [("KH_Cache", K.Special)]
           , K.pandocWriterConfig = pandocWriterConfig
           , K.serializeDict = BRCC.flatSerializeDict
           , K.persistCache = KC.persistStrictByteString (\t → toString (cacheDir <> "/" <> t))
@@ -2044,9 +2069,10 @@ main = do
     DMC.checkCensusTables filteredCensusTables_C
 -}
 --    compareCSR_ASR cmdLine postInfo
-    asAE_Tracts
-    asAE_PUMAs
-    asAE_TractsFromPUMAs
+    csrASR_Tracts 100
+--    asAE_Tracts
+--    asAE_PUMAs
+--    asAE_TractsFromPUMAs
 --    asAE_average_stuff
 --    DED.mapPE $ compareAS_AE cmdLine postInfo
 --    DED.mapPE $ compareAS_AR cmdLine postInfo
@@ -2087,6 +2113,9 @@ shuffle l = go l [] where
     let (s, mT) = NE.uncons neT
         rhl = maybe [] NE.toList mT
     go (lhl <> rhl) (s : xs)
+
+randomIndices :: (K.KnitEffects r, K.Member PR.RandomFu r) => Int -> Int -> K.Sem r [Int]
+randomIndices vecSize numIndices = take numIndices <$> shuffle [0..(vecSize - 1)]
 
 shuffleNE :: (K.KnitEffects r, K.Member PR.RandomFu r) => NonEmpty a -> K.Sem r (NonEmpty a)
 shuffleNE ne = do
@@ -2228,7 +2257,7 @@ shiroData = do
   let formatACSMicro = FCSV.formatWithShow V.:& wText V.:& FCSV.formatWithShow -- header
                      V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow V.:& FCSV.formatWithShow -- cats
                      V.:& FCSV.formatWithShow V.:& V.RNil
-      (srcWindow, cachedSrc) = ACS.acs1Yr2010_20
+      (srcWindow, cachedSrc) = ACS.acs1Yr2012_22
   exampleACSMicro <- K.ignoreCacheTimeM (fmap exampleF <$> DDP.cachedACSa5 srcWindow cachedSrc  2020)
   K.liftKnit @IO $ FCSV.writeLines "../forShiro/exACSMicro.csv"
     $ FCSV.streamSV' @_ @(StreamlyStream Stream) newHeaderMap formatACSMicro ","
