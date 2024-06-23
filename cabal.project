@@ -1,7 +1,7 @@
-packages: ./ ../../libs/model-demographic ../../libs/data-ACS-Tables ../../libs/data-loading ../../libs/data-ACS-PUMS
+packages: ./ ../../libs/model-demographic
 jobs: 4
 with-compiler: ghc
-profiling: False
+profiling: True
 
 allow-newer: polysemy-zoo:ghc-prim, streamly-core
            , freer-simple:template-haskell
@@ -19,9 +19,9 @@ import: ../../libs/cabal_repo_imports/post-tools.project
 import: ../../libs/cabal_repo_imports/small-data-sets.project
 import: ../../libs/cabal_repo_imports/data-types.project
 import: ../../libs/cabal_repo_imports/data-tools.project
---import: ../../libs/cabal_repo_imports/data-loading.project
---import: ../../libs/cabal_repo_imports/data-ACS-Tables.project
---import: ../../libs/cabal_repo_imports/data-ACS-PUMS.project
+import: ../../libs/cabal_repo_imports/data-loading.project
+import: ../../libs/cabal_repo_imports/data-ACS-Tables.project
+import: ../../libs/cabal_repo_imports/data-ACS-PUMS.project
 import: ../../libs/cabal_repo_imports/model-tools.project
 --import: ../../libs/cabal_repo_imports/model-demographic.project
 import: ../../libs/cabal_repo_imports/haskell-stan.project

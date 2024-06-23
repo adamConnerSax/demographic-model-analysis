@@ -1194,48 +1194,15 @@ csrASR_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
                       $ BRCC.retrieveOrMakeD (cacheDir  <> "tractProducts.bin") prodDeps
                       $ \(csr, asr) -> pure $ FlatMatrix $ products csrKeys asrKeys toCASR csr asr
   numTracts <- logTime "counting tracts" $ (LA.cols <$> K.ignoreCacheTime tractsCSR_C)
-  testIndices <- randomIndices numTracts n
+  testIndices <- randomIndices' numTracts n
   let testM m = m LA.?? (LA.All, LA.Pos $ LA.idxs testIndices)
-      predictAvg (pumaAlphas, tractProducts) =
+      predictAvgSLSQP (pumaAlphas, tractProducts) =
         let p = testM tractProducts
         in estimate nullVecsSVD (averageAlphaModel pumaAlphas) (euclideanSLSQP nullVecsSVD) p p
   avgPredictOW <- logTime ("Predict " <> show n <> " via optimal weights")
                   $ K.ignoreCacheTime
-                  $ K.wctBind predictAvg $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
+                  $ K.wctBind predictAvgSLSQP $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
 
---  K.ignoreCacheTime tractProd_CASR_C >>= K.logLE K.Info . show
-{-
-  alphaModelSRCA_C <- logTime "Building alphaModel via LR"
-                      $ BRCC.retrieveOrMakeD "test/Demographics/tractsCSR_ASR/pumaAlphaModelLR" pumaFullAndProd_C
-                      $ \(full, prod) -> pure $ alphaProductLR full prod
--}
-{-
-    logTime "tracts to CSR matrix"
-                 $ fmap (fmap matrix)
-                 $ BRCC.retrieveOrMakeD "test/demographics/allTractsASE.bin" tractTables_C
-                 $ pure
-                 . FlatMatrix
-                 . FL.fold (labeledToMatFld (F.rcast @TractGeoR) (F.rcast @DMC.CSR) (realToFrac . view DT.popCount))
-                 . aggregateAndZeroFillTables @TractGeoR @DMC.CSR
-                 . fmap F.rcast
-                 . ACS.citizenshipSexRace
--}
-{-
-  allTractsASR_C <- logTime "tractsToASR matrix"
-                    $ BRCC.retrieveOrMakeFrame "test/demographics/allTractsASE.bin" tractTables_C
-                    $ pure . (aggregateAndZeroFillTables @TractGeoR @DMC.CSR . fmap F.rcast . ACS.ageSexRace)
--}
-{-
-  tractIds <-  logTime "Ids to list (load cached data)" (FL.fold (FL.premap (view GT.tractGeoId) FL.list) <$> K.ignoreCacheTime allTractsASE_C)
-  let n = FL.fold FL.length tractIds
-  K.logLE K.Info $  "Loaded " <> show n <> " rows; " <> show (n `div` 40) <> " tracts."
-  let ms = DMC.marginalStructure @DMC.ASE  @'[DT.SexC] @'[DT.Education4C] @DMS.CellWithDensity @'[DT.Age5C] DMS.cwdWgtLens DMS.innerProductCWD
-  nullVecsSVD <- K.knitMaybe "asAE_Tracts_Avg: Problem constructing SVD nullVecs. Bad marginal subsets?"
-                 $  DTP.nullVecsMS ms Nothing
-
-  (te, teP, tr, trP) <- buildCachedTestTrain @[GT.StateAbbreviation, GT.TractGeoId] (view GT.stateAbbreviation) (view GT.tractGeoId) ms "test/demographics/Tracts_AS_AE/" allTractsASE_C
-  reportVariations nullVecsSVD (te, teP) (tr, trP)
--}
   pure ()
 
 asAE_PUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
@@ -2069,7 +2036,7 @@ main = do
     DMC.checkCensusTables filteredCensusTables_C
 -}
 --    compareCSR_ASR cmdLine postInfo
-    csrASR_Tracts 100
+    csrASR_Tracts 10000
 --    asAE_Tracts
 --    asAE_PUMAs
 --    asAE_TractsFromPUMAs
@@ -2103,6 +2070,11 @@ getRandomInt :: K.Member PR.RandomFu r => Int -> K.Sem r Int
 getRandomInt max =
   PR.sampleRVar $ (R.uniform 0 max)
 
+getRandomInts :: K.Member PR.RandomFu r => Int -> Int -> K.Sem r [Int]
+getRandomInts n max =
+  PR.sampleRVar $ replicateM n (R.uniform 0 max)
+
+
 shuffle :: (K.KnitEffects r, K.Member PR.RandomFu r) => [a] -> K.Sem r [a]
 shuffle l = go l [] where
   go [] xs = pure xs
@@ -2116,6 +2088,10 @@ shuffle l = go l [] where
 
 randomIndices :: (K.KnitEffects r, K.Member PR.RandomFu r) => Int -> Int -> K.Sem r [Int]
 randomIndices vecSize numIndices = take numIndices <$> shuffle [0..(vecSize - 1)]
+
+randomIndices' :: (K.KnitEffects r, K.Member PR.RandomFu r) => Int -> Int -> K.Sem r [Int]
+randomIndices' vecSize numIndices = getRandomInts numIndices (vecSize - 1)
+
 
 shuffleNE :: (K.KnitEffects r, K.Member PR.RandomFu r) => NonEmpty a -> K.Sem r (NonEmpty a)
 shuffleNE ne = do
