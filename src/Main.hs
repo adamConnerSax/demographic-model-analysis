@@ -81,6 +81,7 @@ import Frames.Streamly.Streaming.Streamly (StreamlyStream, Stream)
 import Frames.Streamly.Streaming.Class (StreamFunctions(..), StreamFunctionsIO(..))
 import qualified Streamly.Data.Stream as Streamly
 import qualified Streamly.Prelude as StreamlyP
+import qualified Streamly.Data.Stream.Prelude as Streamly
 import qualified Control.MapReduce as MR
 import qualified Frames.MapReduce as FMR
 
@@ -1084,15 +1085,15 @@ products aKeys bKeys toK aM bM = LA.fromColumns $ zipWith f (LA.toColumns aM) (L
   f a b = VS.fromList $ fmap (getSum . snd) $ sortOn fst $ fmap (first toK) $ DMS.tableProductL DMS.innerProductSum (toMap aKeys a) (toMap bKeys b)
 
 -- covariates to alphas
-type AlphaModel r = LA.Vector Double -> K.Sem r (LA.Vector Double)
+type AlphaModel m = LA.Vector Double -> m (LA.Vector Double)
 
-averageAlphaModel :: LA.Matrix Double -> AlphaModel r
+averageAlphaModel :: Applicative m => LA.Matrix Double -> AlphaModel m
 averageAlphaModel rawAlphaM = const $ pure mean
   where (mean, _) = LA.meanCov $ LA.tr rawAlphaM
 
 -- NB: our inputs are one column per geography but
 -- W'W \beta = W'A is written for the transposes of the
-alphaProductLR :: LA.Matrix Double -> LA.Matrix Double -> AlphaModel r
+alphaProductLR :: Applicative m => LA.Matrix Double -> LA.Matrix Double -> AlphaModel m
 alphaProductLR pM aM  = pure . (beta' LA.#>)
   where
     w = LA.tr pM
@@ -1100,41 +1101,49 @@ alphaProductLR pM aM  = pure . (beta' LA.#>)
     wChol = LA.chol wTw
     beta' = LA.tr $ LA.cholSolve wChol $ pM LA.<> LA.tr aM
 
+-- general function to do toCols . traverse f . fromCols using streamly
+applyToCols :: (VS.Storable a, LA.Element a, Applicative m) => (VS.Vector a -> m (VS.Vector a)) -> LA.Matrix a -> m (LA.Matrix a)
+applyToCols f = fmap LA.fromColumns . traverse f . LA.toColumns
+
+streamlyApplyToCols :: (Streamly.MonadAsync m, LA.Element a, VS.Storable a)
+                    => (Streamly.Config -> Streamly.Config) -> (VS.Vector a -> m (VS.Vector a)) -> LA.Matrix a -> m (LA.Matrix a)
+streamlyApplyToCols cf f = fmap LA.fromColumns . Streamly.toList . Streamly.parMapM cf f . Streamly.fromList . LA.toColumns
+
 -- matrix of covariates to matrix of alphas
-applyAlphaModel :: AlphaModel r -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
-applyAlphaModel am = fmap LA.fromColumns . traverse am . LA.toColumns
+applyAlphaModel :: Applicative m => AlphaModel m -> LA.Matrix Double -> m (LA.Matrix Double)
+applyAlphaModel = applyToCols
 
 trueAlpha :: DTP.NullVectorProjections k -> LA.Matrix Double -> LA.Matrix Double -> LA.Matrix Double
 trueAlpha nv true prod = DTP.fullToProjM nv LA.<> diffs
   where diffs = true - prod
 
-type OnSimplex r = LA.Vector Double -> LA.Vector Double -> K.Sem r (LA.Vector Double)
+type OnSimplex m = LA.Vector Double -> LA.Vector Double -> m (LA.Vector Double)
 
-applyOnSimplex :: OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
+applyOnSimplex :: Applicative  m => OnSimplex m -> LA.Matrix Double -> LA.Matrix Double -> m (LA.Matrix Double)
 applyOnSimplex os pM aM = fmap LA.fromColumns $ traverse (uncurry os) $ zip (LA.toColumns pM) (LA.toColumns aM)
 
-noOnSimplex :: OnSimplex r
+noOnSimplex :: Applicative m => OnSimplex m
 noOnSimplex _ aM = pure aM
 
-nearestOnSimplex :: DTP.NullVectorProjections k  -> OnSimplex r
+nearestOnSimplex :: Applicative m => DTP.NullVectorProjections k  -> OnSimplex m
 nearestOnSimplex nvps pM aM = pure $ DTP.fullToProj nvps $ DTP.projectToSimplex (pM + DTP.projToFull nvps aM)
 
-euclideanSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex r
+euclideanSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex (K.Sem r)
 euclideanSLSQP nvps pM aM = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig DTP.euclideanFull nvps aM pM
 
-nnls :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex r
+nnls :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex (K.Sem r)
 nnls nvps pV aV = DED.mapPE $ DTP.optimalWeightsAS DTP.defaultActiveSetConfig Nothing Nothing nvps aV pV
 
-weightedSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> (Double -> Double) -> OnSimplex r
+weightedSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> (Double -> Double) -> OnSimplex (K.Sem r)
 weightedSLSQP nvps f pM aM = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsConfig (DTP.euclideanWeighted f) nvps aM pM
 
-modelAndSimplex :: AlphaModel r -> OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
+modelAndSimplex :: Monad m => AlphaModel m -> OnSimplex m -> LA.Matrix Double -> LA.Matrix Double -> m (LA.Matrix Double)
 modelAndSimplex am os covM pM = applyAlphaModel am covM >>= \aM -> applyOnSimplex os pM aM
 
 estimates :: DTP.NullVectorProjections k -> LA.Matrix Double -> LA.Matrix Double -> LA.Matrix Double
 estimates nvps pM aM = pM + DTP.projToFullM nvps LA.<> aM
 
-estimate :: DTP.NullVectorProjections k -> AlphaModel r -> OnSimplex r -> LA.Matrix Double -> LA.Matrix Double -> K.Sem r (LA.Matrix Double)
+estimate :: Monad m => DTP.NullVectorProjections k -> AlphaModel m -> OnSimplex m -> LA.Matrix Double -> LA.Matrix Double -> m (LA.Matrix Double)
 estimate nvps am os covM pM = fmap (estimates nvps pM) $ modelAndSimplex am os covM pM
 
 asAE_Tracts :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
@@ -1199,10 +1208,15 @@ csrASR_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
       predictAvgSLSQP (pumaAlphas, tractProducts) =
         let p = testM tractProducts
         in estimate nullVecsSVD (averageAlphaModel pumaAlphas) (euclideanSLSQP nullVecsSVD) p p
-  avgPredictOW <- logTime ("Predict " <> show n <> " via optimal weights")
+  avgPredictSLSQP <- logTime ("Predict " <> show n <> " avg/SLSQP")
+                     $ K.ignoreCacheTime
+                     $ K.wctBind predictAvgSLSQP $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
+  let predictAvgNNLS (pumaAlphas, tractProducts) =
+        let p = testM tractProducts
+        in estimate nullVecsSVD (averageAlphaModel pumaAlphas) (nnls nullVecsSVD) p p
+  avgPredictOW <- logTime ("Predict " <> show n <> " avg/NNLS")
                   $ K.ignoreCacheTime
-                  $ K.wctBind predictAvgSLSQP $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
-
+                  $ K.wctBind predictAvgNNLS $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
   pure ()
 
 asAE_PUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
