@@ -1243,16 +1243,15 @@ csrASR_ASER_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
   testIndices <- randomIndices' numTracts n
   let testM m = m LA.?? (LA.All, LA.Pos $ LA.idxs testIndices)
       predictAvgSLSQP nv (pumaAlphas, tractProducts) =
-        let p = testM tractProducts
-        in logTime "predict (SLSQP)" $ estimate nv (averageAlphaModel pumaAlphas) (euclideanSLSQP nv) p p
-  let tractsCASR_C = K.wctBind (predictAvgSLSQP nullVecsCASR) $ (,) <$> pumaCASRAlphas_C <*> tractProd_CASR_C
-  tractsCASR <- K.ignoreCacheTime tractsCASR_C
+        logTime "predict (SLSQP)" $ estimate nv (averageAlphaModel pumaAlphas) (euclideanSLSQP nv) tractProducts tractProducts
+  let tractsCASR_C = K.wctBind (predictAvgSLSQP nullVecsCASR) $ (,) <$> pumaCASRAlphas_C <*> fmap testM tractProd_CASR_C
+  --ractsCASR <- K.ignoreCacheTime tractsCASR_C
 
-  casrKeys :: F.Record DMC.CASR -> (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC, DT.Age5C])
-  casrKeys k = (F.rcast @[DT.SexC, DT.Race5C] k, F.rcast @[DT.CitizenC, DT.Age5C] k)
+  let casrKeys :: F.Record DMC.CASR -> (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC, DT.Age5C])
+      casrKeys k = (F.rcast @[DT.SexC, DT.Race5C] k, F.rcast @[DT.CitizenC, DT.Age5C] k)
 
-  toCASER :: (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC, DT.Age5C], F.Record '[DT.Education4C]) -> F.Record DMC.CASER
-  toCASER (sr, ca, e) = F.rcast @DMC.CASER (sr F.<+> ca F.<+> e)
+      toCASER :: (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC, DT.Age5C], F.Record '[DT.Education4C]) -> F.Record DMC.CASER
+      toCASER (sr, ca, e) = F.rcast @DMC.CASER (sr F.<+> ca F.<+> e)
 
   pumaCASER_C <- logTime "Full PUMA data to zero-filled CASER"
                  $ BRCC.retrieveOrMakeFrame  (cacheDir <> "pumaCASER.bin") puma_C
@@ -1266,12 +1265,9 @@ csrASR_ASER_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
                        $ fmap (fmap matrix)
                        $ BRCC.retrieveOrMakeD (cacheDir <> "pumaCASER_alphas.bin") pumaCASERFullAndProd_C
                        $ \ (f, p) -> pure $ FlatMatrix $ trueAlpha nullVecsCASER f p
-  casrSER_prodDeps = (,) <$> tractsCASR_C <*> tractsSER_C
-  tractProd_CASER_C <- logTime "make tract CASER products"
-                       $ fmap (fmap matrix)
-                       $ BRCC.retrieveOrMakeD (cacheDir  <> "casrSER_tractProducts.bin") casrSER_prodDeps
-                       $ \(casr, ser) -> pure $ FlatMatrix $ products casrKeys serKeys toCASER casr ser
-  let tractsCASER_C = K.wctBind (predictAvgSLSQP nullVecsCASER) $ (,) <$> pumaCASERAlphas_C <*> tractProd_CASER_C
+  let casrSER_prodDeps = (,) <$> tractsCASR_C <*> fmap testM tractsSER_C -- because the CASR set is already reduced
+      tractProd_CASER_C =  K.wctBind (\(casr, ser) ->  logTime "make tract CASER products" $ pure $ products casrKeys serKeys toCASER casr ser) casrSER_prodDeps
+      tractsCASER_C = K.wctBind (predictAvgSLSQP nullVecsCASER) $ (,) <$> pumaCASERAlphas_C <*> tractProd_CASER_C
   finalCount <- LA.cols <$> K.ignoreCacheTime tractsCASER_C
   K.logLE K.Info $ "Final matrix has " <> show finalCount <> " cols"
 
@@ -2106,7 +2102,7 @@ main = do
         (K.defaultKnitConfig $ Just cacheDir)
           { K.outerLogPrefix = Just "2022-Demographics"
           , K.logIf = BR.knitLogSeverity $ BR.logLevel cmdLine -- K.logDiagnostic
-          , K.lcSeverity = M.fromList [("KH_Cache", K.Special)]
+--          , K.lcSeverity = M.fromList [("KH_Cache", K.Special)]
           , K.pandocWriterConfig = pandocWriterConfig
           , K.serializeDict = BRCC.flatSerializeDict
           , K.persistCache = KC.persistStrictByteString (\t → toString (cacheDir <> "/" <> t))
