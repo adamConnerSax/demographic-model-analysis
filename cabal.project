@@ -1,7 +1,7 @@
-packages: ./ ../../libs/model-demographic ~/DataScience/data-science-utils
+packages: ./ ../../libs/model-demographic ~/DataScience/data-science-utils ~/DataScience/nlopt-haskell
 jobs: 4
 with-compiler: ghc
-profiling: True
+profiling: False
 
 allow-newer: polysemy-zoo:ghc-prim, streamly-core
            , freer-simple:template-haskell

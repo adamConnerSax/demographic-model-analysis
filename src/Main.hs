@@ -99,6 +99,8 @@ import qualified Graphics.Vega.VegaLite.JSON as VJ
 
 import qualified System.Environment as Env
 
+import qualified Numeric.NNLS.LH as LH
+
 import GHC.Debug.Stub (withGhcDebug)
 
 templateVars ∷ M.Map String String
@@ -935,7 +937,7 @@ asrASE_average_stuff = do
   let toJoint nv alphas = pumaProductsTM + DTP.projToFullM nv LA.<> alphas
       owOptimizerDataSVD = zip (LA.toColumns pumaProductsTM) (replicate nPUMA meanAlphaSVD)
       nnlsConfig = DTP.defaultActiveSetConfig { DTP.cfgLogging = DTP.LogOnError, DTP.cfgStart = DTP.StartGS, DTP.cfgSolver = DTP.SolveLS}
-      nnlsLSI_E nV = K.liftKnit @IO $ DTP.precomputeFromE nnlsConfig (DTP.projToFullM nV)
+      nnlsLSI_E nV = LH.precomputeFromE (DTP.projToFullM nV)
       leftError me = do
         e <- me
         case e of
@@ -945,7 +947,7 @@ asrASE_average_stuff = do
 --  aaASTensor <- LA.fromColumns <$> (traverse (asOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
   aaASSVD <- logTime "NNLS" (LA.fromColumns <$> (traverse (asOptimize nullVecsSVD Nothing) $ owOptimizerDataSVD))
   K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
-  aaASSVD <- logTime "NNLS (precompute)" (LA.fromColumns <$> (leftError (nnlsLSI_E nullVecsSVD) >>= \lsiE -> (traverse (asOptimize nullVecsSVD (Just lsiE)) $ owOptimizerDataSVD)))
+  aaASSVD <- logTime "NNLS (precompute)" (LA.fromColumns <$> (traverse (asOptimize nullVecsSVD (Just $ nnlsLSI_E nullVecsSVD)) $ owOptimizerDataSVD))
   K.logLE K.Info $ "avg SVD NNLS (precompute) deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
 
 
@@ -1137,7 +1139,7 @@ nearestOnSimplex nvps pM aM = pure $ DTP.fullToProj nvps $ DTP.projectToSimplex 
 euclideanSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> OnSimplex (K.Sem r)
 euclideanSLSQP nvps pM aM = DED.mapPE $ DTP.optimalWeights DTP.defaultOptimalWeightsAlgoConfig (DTP.OWKLogLevel $ K.Debug 3) DTP.euclideanFull nvps aM pM
 
-nnls :: K.KnitEffects r => DTP.ActiveSetConfiguration -> Maybe DTP.LSI_E -> DTP.NullVectorProjections k -> OnSimplex (K.Sem r)
+nnls :: K.KnitEffects r => DTP.ActiveSetConfiguration -> Maybe LH.LSI_E -> DTP.NullVectorProjections k -> OnSimplex (K.Sem r)
 nnls cfg mLSIE nvps pV aV = DED.mapPE $ DTP.optimalWeightsAS cfg Nothing mLSIE nvps aV pV
 
 weightedSLSQP :: K.KnitEffects r => DTP.NullVectorProjections k -> (Double -> Double) -> OnSimplex (K.Sem r)
@@ -1242,17 +1244,28 @@ csrASR_ASER_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
   numTracts <- logTime "counting tracts" $ (LA.cols <$> K.ignoreCacheTime tractsCSR_C)
   testIndices <- randomIndices' numTracts n
   let testM m = m LA.?? (LA.All, LA.Pos $ LA.idxs testIndices)
-      predictAvgSLSQP nv (pumaAlphas, tractProducts) =
-        logTime "predict (SLSQP)" $ estimate nv (averageAlphaModel pumaAlphas) (euclideanSLSQP nv) tractProducts tractProducts
-  let tractsCASR_C = K.wctBind (predictAvgSLSQP nullVecsCASR) $ (,) <$> pumaCASRAlphas_C <*> fmap testM tractProd_CASR_C
-  --ractsCASR <- K.ignoreCacheTime tractsCASR_C
+      predictAvgSLSQP t nv (pumaAlphas, tractProducts) =
+        logTime ("predict " <> t <> " (SLSQP)" $ estimate nv (averageAlphaModel pumaAlphas) (euclideanSLSQP nv) tractProducts tractProducts
+  let tractsCASR_C = K.wctBind (predictAvgSLSQP "CASR" nullVecsCASR) $ (,) <$> pumaCASRAlphas_C <*> fmap testM tractProd_CASR_C
+
+
+  let nnlsConfig = DTP.defaultActiveSetConfig { DTP.cfgLogging = DTP.LogOnError, DTP.cfgStart = DTP.StartZero, DTP.cfgSolver = DTP.SolveLS}
+      lsiE_CASR = LH.precomputeFromE (DTP.projToFullM nullVecsCASR)
+
+  let predictNNLS t nullVecs (pumaAlphas, tractProducts) =
+        let lsiE = LH.precomputeFromE (DTP.projToFullM nullVecs)
+        in logTime ("Predict " <> t <> " " <> show n <> " NNLS")
+           $ estimate nullVecs (averageAlphaModel pumaAlphas) (nnls nnlsConfig (Just lsiE) nullVecs) tractProducts tractProducts
+  let nnlsCASR_C = K.wctBind (predictNNLS "CASR" nullVecsCASR) $ (,) <$> pumaCASRAlphas_C <*> tractProd_CASR_C
+--  nnlsCASRCount <- LA.cols <$> K.ignoreCacheTime nnlsCASR_C
+--  K.logLE K.Info $ "Final nnls matrix has " <> show nnlsCASRCount <> " cols"
+
 
   let casrKeys :: F.Record DMC.CASR -> (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC, DT.Age5C])
       casrKeys k = (F.rcast @[DT.SexC, DT.Race5C] k, F.rcast @[DT.CitizenC, DT.Age5C] k)
 
       toCASER :: (F.Record [DT.SexC, DT.Race5C], F.Record '[DT.CitizenC, DT.Age5C], F.Record '[DT.Education4C]) -> F.Record DMC.CASER
       toCASER (sr, ca, e) = F.rcast @DMC.CASER (sr F.<+> ca F.<+> e)
-
   pumaCASER_C <- logTime "Full PUMA data to zero-filled CASER"
                  $ BRCC.retrieveOrMakeFrame  (cacheDir <> "pumaCASER.bin") puma_C
                  $ pure . aggregateAndZeroFillTables @DDP.ACSByPUMAGeoR @DMC.CASER . fmap F.rcast
@@ -1267,10 +1280,9 @@ csrASR_ASER_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
                        $ \ (f, p) -> pure $ FlatMatrix $ trueAlpha nullVecsCASER f p
   let casrSER_prodDeps = (,) <$> tractsCASR_C <*> fmap testM tractsSER_C -- because the CASR set is already reduced
       tractProd_CASER_C =  K.wctBind (\(casr, ser) ->  logTime "make tract CASER products" $ pure $ products casrKeys serKeys toCASER casr ser) casrSER_prodDeps
-      tractsCASER_C = K.wctBind (predictAvgSLSQP nullVecsCASER) $ (,) <$> pumaCASERAlphas_C <*> tractProd_CASER_C
-  finalCount <- LA.cols <$> K.ignoreCacheTime tractsCASER_C
-  K.logLE K.Info $ "Final matrix has " <> show finalCount <> " cols"
-
+      tractsCASER_C = K.wctBind (predictAvgSLSQP "CASER" nullVecsCASER) $ (,) <$> pumaCASERAlphas_C <*> tractProd_CASER_C
+  slsqpCASERCount <- LA.cols <$> K.ignoreCacheTime tractsCASER_C
+  K.logLE K.Info $ "Final matrix has " <> show slsqpCASERCount <> " cols"
 
 
 {-
@@ -1282,16 +1294,11 @@ csrASR_ASER_Tracts n = K.wrapPrefix "csrASR_Tracts" $ do
                                       KS.streamlyToKnit
                                       $ modelSimplexEstimatesP (Streamly.maxThreads 1 . Streamly.ordered True) nullVecsSVD (averageAlphaModel pumaAlphaM) (streamlyOWOS nullVecsSVD) pM pM)
                        $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
-
-  let nnlsConfig = DTP.defaultActiveSetConfig { DTP.cfgLogging = DTP.LogOnError, DTP.cfgStart = DTP.StartZero, DTP.cfgSolver = DTP.SolveLS}
-  nnlsLSI_E <- (K.liftKnit @IO $ DTP.precomputeFromE nnlsConfig (DTP.projToFullM nullVecsSVD)) >>= fmap Just . K.knitEither
-  let predictAvgNNLS (pumaAlphas, tractProducts) =
-        let p = testM tractProducts
-        in estimate nullVecsSVD (averageAlphaModel pumaAlphas) (nnls nnlsConfig nnlsLSI_E nullVecsSVD) p p
-  avgPredictOW <- logTime ("Predict " <> show n <> " avg/NNLS")
-                  $ K.ignoreCacheTime
-                  $ K.wctBind predictAvgNNLS $ (,) <$> pumaAlphas_C <*> tractProd_CASR_C
 -}
+  let nnlsCASER_C = K.wctBind (predictNNLS "CASER" nullVecsCASER) $ (,) <$> pumaCASERAlphas_C <*> tractProd_CASER_C
+  nnlsCASERCount <- LA.cols <$> K.ignoreCacheTime nnlsCASER_C
+  K.logLE K.Info $ "Final nnls matrix has " <> show nnlsCASERCount <> " cols"
+
   pure ()
 
 asAE_PUMAs :: (K.KnitMany r, K.KnitEffects r, BRCC.CacheEffects r, K.Member PR.RandomFu r) => K.Sem r ()
@@ -1512,7 +1519,7 @@ asAE_average_stuff = do
 --  tryF "x^(-0.25)" (\x -> x ** (-0.25))
   K.logLE K.Info $ "Weight vector optimization via NNLS"
   let nnlsConfig = DTP.defaultActiveSetConfig { DTP.cfgLogging = DTP.LogOnError, DTP.cfgStart = DTP.StartGS, DTP.cfgSolver = DTP.SolveLS }
-      nnlsLSI_E nV = K.liftKnit @IO $ DTP.precomputeFromE nnlsConfig (DTP.projToFullM nV)
+      nnlsLSI_E nV = LH.precomputeFromE $ DTP.projToFullM nV
       leftError me = do
         e <- me
         case e of
@@ -1522,7 +1529,7 @@ asAE_average_stuff = do
 --  aaASTensor <- LA.fromColumns <$> (traverse (asOptimize nullVecsTensor) $ owOptimizerData meanAlphaTensor)
   aaASSVD <- logTime "NNLS (SVD), naive" (LA.fromColumns <$> (traverse (asOptimize nullVecsSVD Nothing) $ owOptimizerData meanAlphaSVD))
   K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD)
-  aaASSVD' <- logTime "NNLS (SVD), precompute" (LA.fromColumns <$> (leftError (nnlsLSI_E nullVecsSVD) >>= \lsiE -> (traverse (asOptimize nullVecsSVD (Just lsiE)) $ owOptimizerData meanAlphaSVD)))
+  aaASSVD' <- logTime "NNLS (SVD), precompute" (LA.fromColumns <$> (traverse (asOptimize nullVecsSVD (Just $ nnlsLSI_E nullVecsSVD)) $ owOptimizerData meanAlphaSVD))
 --  K.logLE K.Info $ "avg Tensor AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsTensor aaASTensor)
   K.logLE K.Info $ "avg SVD AAAS deviation=" <> show (FL.fold FL.mean $ totalDeviations $ toJoint nullVecsSVD aaASSVD')
 --      totalDev
